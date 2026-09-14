@@ -19,11 +19,11 @@ use std::convert::{TryFrom, TryInto};
 use std::io;
 
 /// [u32 crc][u32 body_len] — crc covers body_len and the body.
-pub(crate) const HEADER_LEN: usize = 8;
+pub const HEADER_LEN: usize = 8;
 const CRC_LEN: usize = 4;
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Command<'a> {
+pub enum Command<'a> {
     Set {
         ts: u64,
         key: &'a [u8],

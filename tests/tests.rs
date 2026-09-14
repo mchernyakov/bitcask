@@ -308,6 +308,42 @@ fn remove_key() -> Result<()> {
     Ok(())
 }
 
+// Writing more than one file's worth of data must roll over into new data
+// files, and every value must survive a reopen from the multi-file state.
+#[test]
+fn rotation_splits_log_into_multiple_files() -> Result<()> {
+    let temp_dir = TempDir::new().expect("unable to create temporary working directory");
+    let mut store = Bitcask::open(temp_dir.path(), DurabilityPolicy::OsDecides)?;
+
+    let value = "v".repeat(1024);
+    for i in 0..3000 {
+        store.set(&format!("key{}", i), &value)?;
+    }
+    drop(store);
+
+    let data_files = std::fs::read_dir(temp_dir.path())?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .map(|n| n.len() == "000001.data".len() && n.ends_with(".data"))
+                .unwrap_or(false)
+        })
+        .count();
+    assert!(
+        data_files >= 2,
+        "expected rotation to create multiple .data files, found {data_files}"
+    );
+
+    let mut store = Bitcask::open(temp_dir.path(), DurabilityPolicy::OsDecides)?;
+    for i in (0..3000).step_by(299) {
+        let key = format!("key{}", i);
+        assert_eq!(store.get(&key)?, Some(value.clone()), "lost {key} after reopen");
+    }
+
+    Ok(())
+}
+
 // Insert data until total size of the directory decreases.
 // Test data correctness after compaction.
 #[test]

@@ -5,15 +5,18 @@ key/value store, written from scratch in Rust as a learning project. Loosely
 follows the [PingCAP Talent Plan](https://github.com/pingcap/talent-plan)
 `kvs` project structure, with a custom binary log format instead of JSON.
 
-**Status: WIP.** Single log file today; file rotation, compaction,
-and hint files are next — see [ROADMAP.md](ROADMAP.md).
+**Status: WIP.** The log rotates across multiple data files
+(`000001.data`, …) with an append-only active file and immutable older
+files; compaction and hint files are next — see [ROADMAP.md](ROADMAP.md).
 
 ## How it works
 
-All writes append a record to a log file; an in-memory index (Bitcask's
-"keydir") maps each key to the offset and length of its latest record. Reads
-are a single `pread` at that position — no seeking, no scanning. On startup
-the log is replayed to rebuild the index.
+All writes append a record to the active log file, which rolls over to a new
+file at a size threshold; older files are immutable. An in-memory index
+(Bitcask's "keydir") maps each key to the file, offset, and length of its
+latest record. Reads are a single `pread` at that position — no seeking, no
+scanning. On startup the data files are replayed in id order to rebuild the
+index.
 
 Record format (little-endian):
 

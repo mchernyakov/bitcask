@@ -3,8 +3,14 @@ use kvs::DurabilityPolicy;
 use kvs::KvStore;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
+use tracing_subscriber::EnvFilter;
 
 fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .init();
+
     let mut rl = DefaultEditor::new().unwrap();
 
     print_help();

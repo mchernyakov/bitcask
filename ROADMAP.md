@@ -27,13 +27,13 @@ Groundwork that makes rotation and compaction much easier later.
 
 ## Phase 2 — File rotation
 
-- [ ] Active file gets a monotonic id (`000001.data`, …). Rotate when it
+- [x] Active file gets a monotonic id (`000001.data`, …). Rotate when it
   exceeds a size threshold: flush + sync + open a new active file.
-- [ ] Old files become **immutable** — this invariant is what makes
+- [x] Old files become **immutable** — this invariant is what makes
   compaction and lock-free reads possible.
-- [ ] Keydir entry gains `file_id`. Only the in-memory index changes; the
+- [x] Keydir entry gains `file_id`. Only the in-memory index changes; the
   on-disk record format stays the same.
-- [ ] On open: list `*.data`, sort by id, replay in order (later entries win),
+- [x] On open: list `*.data`, sort by id, replay in order (later entries win),
   keep a read-only handle per file.
 
 ## Phase 3 — Compaction / merge
