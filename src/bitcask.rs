@@ -1,4 +1,5 @@
 use crate::command::{Command, HEADER_LEN};
+use crate::config::Config;
 use crate::kvstore::KvStore;
 use crate::policy::DurabilityPolicy;
 use crate::{KvsError, Result};
@@ -9,10 +10,6 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs, io};
-
-const COMPACTION_THRESHOLD: u64 = 1 << 20; // 1 MB
-const FILE_THRESHOLD: u64 = 1 << 20; // 1 MB
-const FLUSH_THRESHOLD_MILLIS: u64 = 1 * 1000; // 1 second
 
 fn unix_now() -> Result<Duration> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?)
@@ -39,6 +36,9 @@ pub struct Bitcask {
     stale_bytes_count: u64,
     // auxiliary fields
     durability_policy: DurabilityPolicy,
+    file_size_threshold: u64,
+    compaction_threshold: u64,
+    flush_threshold_millis: u64,
 }
 
 impl Drop for Bitcask {
@@ -151,7 +151,7 @@ impl Bitcask {
             }
             DurabilityPolicy::SyncOnInterval => {
                 let now = unix_now()?.as_millis() as u64;
-                if now - self.last_ts_flushed >= FLUSH_THRESHOLD_MILLIS {
+                if now - self.last_ts_flushed >= self.flush_threshold_millis {
                     self.sync()?;
                     self.last_ts_flushed = now;
                 }
@@ -164,7 +164,7 @@ impl Bitcask {
     }
 
     fn handle_file_rotation(&mut self, start_id: u64, forced: bool) -> Result<()> {
-        if !forced && self.offset < FILE_THRESHOLD {
+        if !forced && self.offset < self.file_size_threshold {
             return Ok(());
         }
 
@@ -202,7 +202,7 @@ impl Bitcask {
     fn compaction(&mut self) -> Result<()> {
         // skip if there is just 1 file
         // or if there are no stale bytes
-        if self.readers.len() == 1 || self.stale_bytes_count < COMPACTION_THRESHOLD {
+        if self.readers.len() == 1 || self.stale_bytes_count < self.compaction_threshold {
             return Ok(());
         }
 
@@ -310,7 +310,7 @@ impl Bitcask {
                             }
                         }
                     }
-                    Command::Rm { key, .. } => {
+                    Command::Rm { .. } => {
                         // do nothing, the index is already updated
                     }
                 }
@@ -320,7 +320,7 @@ impl Bitcask {
             compaction_file_writer.get_ref().sync_all()?;
             new_files.insert(compaction_file_id);
 
-            if dest_offset >= FILE_THRESHOLD {
+            if dest_offset >= self.file_size_threshold {
                 compaction_file_writer_opt = None;
                 dest_offset = 0;
             }
@@ -351,11 +351,11 @@ impl Bitcask {
 }
 
 impl KvStore for Bitcask {
-    fn open(dir: impl Into<PathBuf>, durability_policy: DurabilityPolicy) -> Result<Self>
+    fn open(config: Config) -> Result<Self>
     where
         Self: Sized,
     {
-        let dir: PathBuf = dir.into();
+        let dir: PathBuf = config.dir;
         let dir_path: &Path = dir.as_path();
 
         fs::create_dir_all(dir_path)?;
@@ -421,7 +421,10 @@ impl KvStore for Bitcask {
             in_mem_index,
             offset: 0, // the replay func will set this
             flushed_offset: 0,
-            durability_policy,
+            durability_policy: config.durability_policy,
+            file_size_threshold: config.file_size_threshold,
+            compaction_threshold: config.compaction_threshold,
+            flush_threshold_millis: config.flush_threshold_millis,
             last_ts_flushed: unix_now()?.as_millis() as u64,
             stale_bytes_count: 0,
         };
@@ -561,7 +564,7 @@ mod tests {
         file.flush()?;
         drop(file);
 
-        let mut bitcask = Bitcask::open(dir.path(), DurabilityPolicy::OsDecides)?;
+        let mut bitcask = Bitcask::open(Config::new(dir.path()))?;
 
         assert_eq!(bitcask.get("alpha")?, Some("beta".to_owned()));
         assert_eq!(fs::metadata(&log_path)?.len(), valid.len() as u64);

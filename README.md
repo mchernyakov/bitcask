@@ -41,14 +41,34 @@ read-only handle, with an explicit durability policy chosen at `open`:
 
 ## Usage
 
-```rust
-use kvs::{Bitcask, DurabilityPolicy, KvStore};
+The store is opened with a `Config`. `Config::new(dir)` picks sane defaults;
+override individual fields with struct-update syntax:
 
-let mut store = Bitcask::open("./data", DurabilityPolicy::SyncOnInterval)?;
+```rust
+use kvs::{Bitcask, Config, DurabilityPolicy, KvStore};
+
+// defaults: OsDecides, 1 MB files, 1 MB compaction threshold, 1 s flush interval
+let mut store = Bitcask::open(Config::new("./data"))?;
+
+// or tune it:
+let mut store = Bitcask::open(Config {
+    durability_policy: DurabilityPolicy::SyncOnInterval,
+    file_size_threshold: 4 << 20,
+    ..Config::new("./data")
+})?;
+
 store.set("key", "value")?;
 assert_eq!(store.get("key")?, Some("value".to_owned()));
 store.remove("key")?;
 ```
+
+Config fields:
+
+- `dir` — directory holding the data files
+- `durability_policy` — when to fsync (see above)
+- `file_size_threshold` — the active file rolls over to a new one at this size
+- `compaction_threshold` — merge sealed files once this many bytes are stale
+- `flush_threshold_millis` — fsync interval for `SyncOnInterval`
 
 There's also a small interactive REPL: `cargo run --bin kvs`.
 

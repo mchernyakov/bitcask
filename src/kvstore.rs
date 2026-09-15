@@ -1,8 +1,7 @@
-use std::path::PathBuf;
-use crate::policy::DurabilityPolicy;
+use crate::config::Config;
 
 pub trait KvStore {
-    fn open(path: impl Into<PathBuf>, durability_policy: DurabilityPolicy) -> crate::Result<Self>
+    fn open(config: Config) -> crate::Result<Self>
     where
         Self: Sized;
     fn set(&mut self, key: &str, value: &str) -> crate::Result<()>;

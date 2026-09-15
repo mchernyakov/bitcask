@@ -1,5 +1,5 @@
 use kvs::Bitcask;
-use kvs::DurabilityPolicy;
+use kvs::Config;
 use kvs::KvStore;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
@@ -15,7 +15,7 @@ fn main() {
 
     print_help();
 
-    let mut kvstore = match Bitcask::open("kvs/", DurabilityPolicy::OsDecides) {
+    let mut kvstore = match Bitcask::open(Config::new("kvs/")) {
         Ok(store) => store,
         Err(err) => {
             eprintln!("Error opening KvStore (Bitcask): {}", err);

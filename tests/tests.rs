@@ -10,7 +10,7 @@
 //! - The `compaction` test is expected to fail until compaction is implemented.
 
 use assert_cmd::prelude::*;
-use kvs::{Bitcask, DurabilityPolicy, KvStore, Result};
+use kvs::{Bitcask, Config, DurabilityPolicy, KvStore, Result};
 use predicates::ord::eq;
 use predicates::str::{contains, is_empty, PredicateStrExt};
 use std::process::Command;
@@ -83,7 +83,7 @@ fn cli_set() {
 fn cli_get_stored() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
 
-    let mut store = Bitcask::open(temp_dir.path(), DurabilityPolicy::OsDecides)?;
+    let mut store = Bitcask::open(Config::new(temp_dir.path()))?;
     store.set("key1", "value1")?;
     store.set("key2", "value2")?;
     drop(store);
@@ -113,7 +113,7 @@ fn cli_get_stored() -> Result<()> {
 fn cli_rm_stored() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
 
-    let mut store = Bitcask::open(temp_dir.path(), DurabilityPolicy::OsDecides)?;
+    let mut store = Bitcask::open(Config::new(temp_dir.path()))?;
     store.set("key1", "value1")?;
     drop(store);
 
@@ -203,13 +203,19 @@ fn cli_invalid_subcommand() {
 #[test]
 fn set_then_get_with_sync_on_every_put() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    let mut store = Bitcask::open(temp_dir.path(), DurabilityPolicy::SyncOnEveryPut)?;
+    let mut store = Bitcask::open(Config {
+        durability_policy: DurabilityPolicy::SyncOnEveryPut,
+        ..Config::new(temp_dir.path())
+    })?;
 
     store.set("key1", "value1")?;
     assert_eq!(store.get("key1")?, Some("value1".to_owned()));
 
     drop(store);
-    let mut store = Bitcask::open(temp_dir.path(), DurabilityPolicy::SyncOnEveryPut)?;
+    let mut store = Bitcask::open(Config {
+        durability_policy: DurabilityPolicy::SyncOnEveryPut,
+        ..Config::new(temp_dir.path())
+    })?;
     assert_eq!(store.get("key1")?, Some("value1".to_owned()));
 
     Ok(())
@@ -218,7 +224,10 @@ fn set_then_get_with_sync_on_every_put() -> Result<()> {
 #[test]
 fn set_then_get_with_sync_on_interval() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    let mut store = Bitcask::open(temp_dir.path(), DurabilityPolicy::SyncOnInterval)?;
+    let mut store = Bitcask::open(Config {
+        durability_policy: DurabilityPolicy::SyncOnInterval,
+        ..Config::new(temp_dir.path())
+    })?;
 
     store.set("key1", "value1")?;
     assert_eq!(store.get("key1")?, Some("value1".to_owned()));
@@ -235,7 +244,7 @@ fn set_then_get_with_sync_on_interval() -> Result<()> {
 #[test]
 fn get_stored_value() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    let mut store = Bitcask::open(temp_dir.path(), DurabilityPolicy::OsDecides)?;
+    let mut store = Bitcask::open(Config::new(temp_dir.path()))?;
 
     store.set("key1", "value1")?;
     store.set("key2", "value2")?;
@@ -245,7 +254,7 @@ fn get_stored_value() -> Result<()> {
 
     // Open from disk again and check persistent data.
     drop(store);
-    let mut store = Bitcask::open(temp_dir.path(), DurabilityPolicy::OsDecides)?;
+    let mut store = Bitcask::open(Config::new(temp_dir.path()))?;
     assert_eq!(store.get("key1")?, Some("value1".to_owned()));
     assert_eq!(store.get("key2")?, Some("value2".to_owned()));
 
@@ -256,7 +265,7 @@ fn get_stored_value() -> Result<()> {
 #[test]
 fn overwrite_value() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    let mut store = Bitcask::open(temp_dir.path(), DurabilityPolicy::OsDecides)?;
+    let mut store = Bitcask::open(Config::new(temp_dir.path()))?;
 
     store.set("key1", "value1")?;
     assert_eq!(store.get("key1")?, Some("value1".to_owned()));
@@ -265,7 +274,7 @@ fn overwrite_value() -> Result<()> {
 
     // Open from disk again and check persistent data.
     drop(store);
-    let mut store = Bitcask::open(temp_dir.path(), DurabilityPolicy::OsDecides)?;
+    let mut store = Bitcask::open(Config::new(temp_dir.path()))?;
     assert_eq!(store.get("key1")?, Some("value2".to_owned()));
     store.set("key1", "value3")?;
     assert_eq!(store.get("key1")?, Some("value3".to_owned()));
@@ -277,14 +286,14 @@ fn overwrite_value() -> Result<()> {
 #[test]
 fn get_non_existent_value() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    let mut store = Bitcask::open(temp_dir.path(), DurabilityPolicy::OsDecides)?;
+    let mut store = Bitcask::open(Config::new(temp_dir.path()))?;
 
     store.set("key1", "value1")?;
     assert_eq!(store.get("key2")?, None);
 
     // Open from disk again and check persistent data.
     drop(store);
-    let mut store = Bitcask::open(temp_dir.path(), DurabilityPolicy::OsDecides)?;
+    let mut store = Bitcask::open(Config::new(temp_dir.path()))?;
     assert_eq!(store.get("key2")?, None);
 
     Ok(())
@@ -293,7 +302,7 @@ fn get_non_existent_value() -> Result<()> {
 #[test]
 fn remove_non_existent_key() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    let mut store = Bitcask::open(temp_dir.path(), DurabilityPolicy::OsDecides)?;
+    let mut store = Bitcask::open(Config::new(temp_dir.path()))?;
     assert!(store.remove("key1").is_err());
     Ok(())
 }
@@ -301,7 +310,7 @@ fn remove_non_existent_key() -> Result<()> {
 #[test]
 fn remove_key() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    let mut store = Bitcask::open(temp_dir.path(), DurabilityPolicy::OsDecides)?;
+    let mut store = Bitcask::open(Config::new(temp_dir.path()))?;
     store.set("key1", "value1")?;
     assert!(store.remove("key1").is_ok());
     assert_eq!(store.get("key1")?, None);
@@ -313,10 +322,13 @@ fn remove_key() -> Result<()> {
 #[test]
 fn rotation_splits_log_into_multiple_files() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    let mut store = Bitcask::open(temp_dir.path(), DurabilityPolicy::OsDecides)?;
+    let mut store = Bitcask::open(Config {
+        file_size_threshold: 4096,
+        ..Config::new(temp_dir.path())
+    })?;
 
-    let value = "v".repeat(1024);
-    for i in 0..3000 {
+    let value = "v".repeat(64);
+    for i in 0..200 {
         store.set(&format!("key{}", i), &value)?;
     }
     drop(store);
@@ -335,8 +347,8 @@ fn rotation_splits_log_into_multiple_files() -> Result<()> {
         "expected rotation to create multiple .data files, found {data_files}"
     );
 
-    let mut store = Bitcask::open(temp_dir.path(), DurabilityPolicy::OsDecides)?;
-    for i in (0..3000).step_by(299) {
+    let mut store = Bitcask::open(Config::new(temp_dir.path()))?;
+    for i in 0..200 {
         let key = format!("key{}", i);
         assert_eq!(store.get(&key)?, Some(value.clone()), "lost {key} after reopen");
     }
@@ -351,7 +363,11 @@ fn rotation_splits_log_into_multiple_files() -> Result<()> {
 #[test]
 fn overwrite_after_compaction_survives_reopen() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    let mut store = Bitcask::open(temp_dir.path(), DurabilityPolicy::OsDecides)?;
+    let mut store = Bitcask::open(Config {
+        file_size_threshold: 2048,
+        compaction_threshold: 2048,
+        ..Config::new(temp_dir.path())
+    })?;
 
     store.set("k1", "old")?;
 
@@ -359,10 +375,10 @@ fn overwrite_after_compaction_survives_reopen() -> Result<()> {
     // stale and pushes past the compaction threshold, so k1 (still live, still
     // in the old file) gets merged into a compaction output.
     let filler = "v".repeat(32);
-    for i in 0..20000 {
+    for i in 0..100 {
         store.set(&format!("filler{}", i), &filler)?;
     }
-    for i in 0..20000 {
+    for i in 0..100 {
         store.set(&format!("filler{}", i), &filler)?;
     }
 
@@ -370,7 +386,7 @@ fn overwrite_after_compaction_survives_reopen() -> Result<()> {
     assert_eq!(store.get("k1")?, Some("new".to_owned()));
 
     drop(store);
-    let mut store = Bitcask::open(temp_dir.path(), DurabilityPolicy::OsDecides)?;
+    let mut store = Bitcask::open(Config::new(temp_dir.path()))?;
     assert_eq!(store.get("k1")?, Some("new".to_owned()));
     assert_eq!(store.get("filler0")?, Some(filler.clone()));
 
@@ -387,7 +403,7 @@ fn open_removes_compact_leftovers_but_keeps_foreign_files() -> Result<()> {
     let leftover = temp_dir.path().join("000007.data.compact");
     std::fs::write(&leftover, "half-written merge output")?;
 
-    let mut store = Bitcask::open(temp_dir.path(), DurabilityPolicy::OsDecides)?;
+    let mut store = Bitcask::open(Config::new(temp_dir.path()))?;
     store.set("k", "v")?;
     assert_eq!(store.get("k")?, Some("v".to_owned()));
     drop(store);
@@ -406,7 +422,7 @@ fn open_removes_compact_leftovers_but_keeps_foreign_files() -> Result<()> {
 #[test]
 fn compaction() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    let mut store = Bitcask::open(temp_dir.path(), DurabilityPolicy::OsDecides)?;
+    let mut store = Bitcask::open(Config::new(temp_dir.path()))?;
 
     let dir_size = || {
         let entries = WalkDir::new(temp_dir.path()).into_iter();
@@ -436,7 +452,7 @@ fn compaction() -> Result<()> {
 
         drop(store);
         // reopen and check content.
-        let mut store = Bitcask::open(temp_dir.path(), DurabilityPolicy::OsDecides)?;
+        let mut store = Bitcask::open(Config::new(temp_dir.path()))?;
         for key_id in 0..1000 {
             let key = format!("key{}", key_id);
             assert_eq!(store.get(&key)?, Some(format!("{}", iter)));
