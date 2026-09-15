@@ -344,6 +344,63 @@ fn rotation_splits_log_into_multiple_files() -> Result<()> {
     Ok(())
 }
 
+// A key merged into a compaction output (id above the active file) and then
+// overwritten in the still-active file must keep the NEW value across reopen:
+// replay is later-id-wins, so the active writer has to rotate above the
+// compaction outputs before accepting further writes.
+#[test]
+fn overwrite_after_compaction_survives_reopen() -> Result<()> {
+    let temp_dir = TempDir::new().expect("unable to create temporary working directory");
+    let mut store = Bitcask::open(temp_dir.path(), DurabilityPolicy::OsDecides)?;
+
+    store.set("k1", "old")?;
+
+    // First pass seals k1 into an old file; second pass makes the first pass
+    // stale and pushes past the compaction threshold, so k1 (still live, still
+    // in the old file) gets merged into a compaction output.
+    let filler = "v".repeat(32);
+    for i in 0..20000 {
+        store.set(&format!("filler{}", i), &filler)?;
+    }
+    for i in 0..20000 {
+        store.set(&format!("filler{}", i), &filler)?;
+    }
+
+    store.set("k1", "new")?;
+    assert_eq!(store.get("k1")?, Some("new".to_owned()));
+
+    drop(store);
+    let mut store = Bitcask::open(temp_dir.path(), DurabilityPolicy::OsDecides)?;
+    assert_eq!(store.get("k1")?, Some("new".to_owned()));
+    assert_eq!(store.get("filler0")?, Some(filler.clone()));
+
+    Ok(())
+}
+
+// open() cleans up leftover .data.compact temp files from a crashed merge,
+// but must not touch any other file living in the directory.
+#[test]
+fn open_removes_compact_leftovers_but_keeps_foreign_files() -> Result<()> {
+    let temp_dir = TempDir::new().expect("unable to create temporary working directory");
+    let foreign = temp_dir.path().join("notes.txt");
+    std::fs::write(&foreign, "do not delete")?;
+    let leftover = temp_dir.path().join("000007.data.compact");
+    std::fs::write(&leftover, "half-written merge output")?;
+
+    let mut store = Bitcask::open(temp_dir.path(), DurabilityPolicy::OsDecides)?;
+    store.set("k", "v")?;
+    assert_eq!(store.get("k")?, Some("v".to_owned()));
+    drop(store);
+
+    assert!(foreign.exists(), "open() must not delete unrelated files");
+    assert!(
+        !leftover.exists(),
+        "open() should clean up .data.compact leftovers"
+    );
+
+    Ok(())
+}
+
 // Insert data until total size of the directory decreases.
 // Test data correctness after compaction.
 #[test]

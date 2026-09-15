@@ -6,8 +6,9 @@ follows the [PingCAP Talent Plan](https://github.com/pingcap/talent-plan)
 `kvs` project structure, with a custom binary log format instead of JSON.
 
 **Status: WIP.** The log rotates across multiple data files
-(`000001.data`, …) with an append-only active file and immutable older
-files; compaction and hint files are next — see [ROADMAP.md](ROADMAP.md).
+(`000001.data`, …) with an append-only active file and immutable sealed
+files, and stale data is reclaimed by a crash-safe compaction; hint files
+are next — see [ROADMAP.md](ROADMAP.md).
 
 ## How it works
 
@@ -17,6 +18,11 @@ file at a size threshold; older files are immutable. An in-memory index
 latest record. Reads are a single `pread` at that position — no seeking, no
 scanning. On startup the data files are replayed in id order to rebuild the
 index.
+
+When enough bytes go stale (overwrites and removes), sealed files are merged:
+records still referenced by the index are copied into fresh files with ids
+above the active file, the writer rotates above them, and only then are the
+old files deleted — so a crash at any point of the merge is recoverable.
 
 Record format (little-endian):
 
@@ -48,7 +54,8 @@ There's also a small interactive REPL: `cargo run --bin kvs`.
 
 ## Tests
 
-`cargo test -- --skip compaction` — the `compaction` test is the
-definition-of-done for a feature that isn't built yet, and CLI tests are
-ignored until the binary grows a batch mode. Corruption handling is tested
-bit-by-bit: every single-bit flip in a record must be rejected.
+`cargo test` — CLI tests are ignored until the binary grows a batch mode.
+Corruption handling is tested bit-by-bit: every single-bit flip in a record
+must be rejected. Compaction is covered end-to-end: the directory must shrink
+under overwrite load, and every value must survive a reopen from a compacted,
+multi-file state.

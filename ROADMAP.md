@@ -38,14 +38,14 @@ Groundwork that makes rotation and compaction much easier later.
 
 ## Phase 3 — Compaction / merge
 
-- [ ] Merge over **immutable files only** — the active file keeps taking
+- [x] Merge over **immutable files only** — the active file keeps taking
   writes; that's why Bitcask can compact without blocking writers.
-- [ ] Walk old files, keep only entries still current per the keydir, drop
+- [x] Walk old files, keep only entries still current per the keydir, drop
   tombstones whose key doesn't appear in newer files, write survivors into
   fresh data files, atomically update the keydir, delete old files.
-- [ ] Trigger on tracked garbage: count stale bytes as keys are overwritten /
+- [x] Trigger on tracked garbage: count stale bytes as keys are overwritten /
   removed (`COMPACTION_THRESHOLD` is already waiting for this) — no scanning.
-- [ ] **Crash-safety of the merge** is the interesting design problem: write
+- [x] **Crash-safety of the merge** is the interesting design problem: write
   merged output to temp files; delete originals only after new files are
   synced and the keydir is switched. For every step, ask: what state does a
   crash here leave, and does `open()` recover from it?
