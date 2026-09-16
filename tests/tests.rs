@@ -393,6 +393,160 @@ fn overwrite_after_compaction_survives_reopen() -> Result<()> {
     Ok(())
 }
 
+// Every compaction output gets a sibling hint file (000004.data -> 000004.hint)
+// describing its records, and no hint file may outlive its data file.
+#[test]
+fn merge_writes_hint_files_next_to_outputs() -> Result<()> {
+    let temp_dir = TempDir::new().expect("unable to create temporary working directory");
+    let mut store = Bitcask::open(Config {
+        file_size_threshold: 2048,
+        compaction_threshold: 2048,
+        ..Config::new(temp_dir.path())
+    })?;
+
+    let filler = "v".repeat(32);
+    for i in 0..100 {
+        store.set(&format!("filler{}", i), &filler)?;
+    }
+    for i in 0..100 {
+        store.set(&format!("filler{}", i), &filler)?;
+    }
+    drop(store);
+
+    let mut hint_files = 0;
+    let mut non_empty_hint_files = 0;
+    for entry in std::fs::read_dir(temp_dir.path())? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(stem) = name.strip_suffix(".hint") {
+            hint_files += 1;
+            if entry.metadata()?.len() > 0 {
+                non_empty_hint_files += 1;
+            }
+            let data_sibling = temp_dir.path().join(format!("{stem}.data"));
+            assert!(
+                data_sibling.exists(),
+                "hint file {name} has no data file sibling"
+            );
+        }
+    }
+    assert!(hint_files >= 1, "merge should write at least one hint file");
+    assert!(
+        non_empty_hint_files >= 1,
+        "at least one hint file should describe live records"
+    );
+
+    Ok(())
+}
+
+// Hint files are a startup optimization: damaged or orphaned ones must never
+// brick open() or corrupt the recovered data.
+#[test]
+fn open_survives_corrupt_and_orphan_hint_files() -> Result<()> {
+    let temp_dir = TempDir::new().expect("unable to create temporary working directory");
+
+    let config = || Config {
+        file_size_threshold: 2048,
+        compaction_threshold: 2048,
+        ..Config::new(temp_dir.path())
+    };
+
+    let mut store = Bitcask::open(config())?;
+    let filler = "v".repeat(32);
+    for i in 0..100 {
+        store.set(&format!("filler{}", i), &filler)?;
+    }
+    for i in 0..100 {
+        store.set(&format!("filler{}", i), &filler)?;
+    }
+    drop(store);
+
+    // an orphan hint with no data file (e.g. crash between merge steps)
+    std::fs::write(temp_dir.path().join("000099.hint"), b"orphan")?;
+    // a foreign file that merely looks hint-like
+    std::fs::write(temp_dir.path().join("abc.hint"), b"not ours")?;
+
+    // every real hint file gets its content replaced with garbage
+    for entry in std::fs::read_dir(temp_dir.path())? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".hint") && name != "000099.hint" {
+            std::fs::write(entry.path(), b"this is not a hint record")?;
+        }
+    }
+
+    let mut store = Bitcask::open(config())?;
+    for i in 0..100 {
+        let key = format!("filler{}", i);
+        assert_eq!(store.get(&key)?, Some(filler.clone()), "lost {key}");
+    }
+
+    assert!(
+        !temp_dir.path().join("000099.hint").exists(),
+        "orphan hint with no data file should be removed on open"
+    );
+    assert!(
+        temp_dir.path().join("abc.hint").exists(),
+        "foreign .hint files must be kept"
+    );
+
+    Ok(())
+}
+
+// Loading the keydir from hints and rebuilding it by replay must agree, and
+// a successful hint load must not consume the hint files.
+#[test]
+fn reopen_from_hints_matches_replay_from_data() -> Result<()> {
+    let temp_dir = TempDir::new().expect("unable to create temporary working directory");
+    let config = || Config {
+        file_size_threshold: 2048,
+        compaction_threshold: 2048,
+        ..Config::new(temp_dir.path())
+    };
+
+    let mut store = Bitcask::open(config())?;
+    let filler = "v".repeat(32);
+    for i in 0..100 {
+        store.set(&format!("filler{}", i), &filler)?;
+    }
+    for i in 0..100 {
+        store.set(&format!("filler{}", i), &filler)?;
+    }
+    drop(store);
+
+    let hint_paths: Vec<std::path::PathBuf> = std::fs::read_dir(temp_dir.path())?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "hint"))
+        .collect();
+    assert!(!hint_paths.is_empty(), "merge should have written hints");
+
+    // reopen #1: keydir comes from the hints
+    let mut store = Bitcask::open(config())?;
+    for i in 0..100 {
+        let key = format!("filler{}", i);
+        assert_eq!(store.get(&key)?, Some(filler.clone()), "hint path lost {key}");
+    }
+    drop(store);
+
+    for path in &hint_paths {
+        assert!(
+            path.exists(),
+            "a successful hint load must not delete {path:?}"
+        );
+        std::fs::remove_file(path)?;
+    }
+
+    // reopen #2: keydir must come out identical from data replay alone
+    let mut store = Bitcask::open(config())?;
+    for i in 0..100 {
+        let key = format!("filler{}", i);
+        assert_eq!(store.get(&key)?, Some(filler.clone()), "replay path lost {key}");
+    }
+
+    Ok(())
+}
+
 // open() cleans up leftover .data.compact temp files from a crashed merge,
 // but must not touch any other file living in the directory.
 #[test]

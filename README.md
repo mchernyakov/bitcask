@@ -7,8 +7,9 @@ follows the [PingCAP Talent Plan](https://github.com/pingcap/talent-plan)
 
 **Status: WIP.** The log rotates across multiple data files
 (`000001.data`, …) with an append-only active file and immutable sealed
-files, and stale data is reclaimed by a crash-safe compaction; hint files
-are next — see [ROADMAP.md](ROADMAP.md).
+files, stale data is reclaimed by a crash-safe compaction, and hint files
+make startup fast; concurrency (one writer, many readers) is next —
+see [ROADMAP.md](ROADMAP.md).
 
 ## How it works
 
@@ -23,6 +24,13 @@ When enough bytes go stale (overwrites and removes), sealed files are merged:
 records still referenced by the index are copied into fresh files with ids
 above the active file, the writer rotates above them, and only then are the
 old files deleted — so a crash at any point of the merge is recoverable.
+
+Each merge output also gets a sibling hint file (`000004.hint` for
+`000004.data`) listing `key -> (ts, offset, len)` for its records. On startup,
+a sealed file with a valid hint is loaded from the hint instead of being
+replayed; a damaged, torn, or orphaned hint is simply deleted and the data
+file is replayed instead — hints are an optimization, never a source of
+truth.
 
 Record format (little-endian):
 
@@ -76,6 +84,8 @@ There's also a small interactive REPL: `cargo run --bin kvs`.
 
 `cargo test` — CLI tests are ignored until the binary grows a batch mode.
 Corruption handling is tested bit-by-bit: every single-bit flip in a record
-must be rejected. Compaction is covered end-to-end: the directory must shrink
-under overwrite load, and every value must survive a reopen from a compacted,
-multi-file state.
+(data or hint) must be rejected. Compaction is covered end-to-end: the
+directory must shrink under overwrite load, and every value must survive a
+reopen from a compacted, multi-file state. Hint files are proven to be both
+used (startup resolves keys through them) and disposable (corrupt, torn, or
+orphaned hints fall back to data replay).

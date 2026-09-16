@@ -1,5 +1,6 @@
 use crate::command::{Command, HEADER_LEN};
 use crate::config::Config;
+use crate::index_value::IndexValue;
 use crate::kvstore::KvStore;
 use crate::policy::DurabilityPolicy;
 use crate::{KvsError, Result};
@@ -10,15 +11,10 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs, io};
+use tracing::debug;
 
 fn unix_now() -> Result<Duration> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?)
-}
-
-pub struct IndexValue {
-    pub file_id: u64,
-    pub offset: u64,
-    pub len: usize,
 }
 
 pub struct Bitcask {
@@ -57,6 +53,74 @@ impl Bitcask {
 
     fn replay(&mut self) -> Result<()> {
         for (file_id, reader_file) in self.readers.iter() {
+            let hint_file_path = self.dir.join(hint_file_name(*file_id));
+            if (*file_id != self.current_file_id) && fs::exists(&hint_file_path)? {
+                let hint_file = OpenOptions::new().read(true).open(&hint_file_path)?;
+                let mut hint_reader = BufReader::new(hint_file);
+                hint_reader.seek(SeekFrom::Start(0))?;
+                let hint_file_len = hint_reader.get_ref().metadata()?.len();
+
+                let mut position = 0;
+
+                let hint_processed = loop {
+                    let mut header = [0u8; HEADER_LEN];
+                    match hint_reader.read_exact(&mut header) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                            break position == hint_file_len;
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+
+                    let body_len = header[4..8].try_into();
+
+                    let body_len = match body_len {
+                        Ok(bytes) => u32::from_le_bytes(bytes) as usize,
+                        Err(_) => return Err(KvsError::Corruption),
+                    };
+
+                    let remaining = hint_file_len - position - HEADER_LEN as u64;
+                    if body_len as u64 > remaining {
+                        debug!(
+                            "hint file is corrupt, remaining: {}, body_len: {}",
+                            remaining, body_len
+                        );
+                        break false;
+                    }
+
+                    let mut buf = vec![0u8; HEADER_LEN + body_len];
+                    buf[..HEADER_LEN].copy_from_slice(&header);
+
+                    position = position + HEADER_LEN as u64 + body_len as u64;
+
+                    match hint_reader.read_exact(&mut buf[HEADER_LEN..]) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                            break false;
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+
+                    match IndexValue::deserialize(&buf, *file_id) {
+                        Ok((key, value, _)) => {
+                            self.in_mem_index.insert(key.to_vec(), value);
+                        }
+                        Err(_) => {
+                            break false;
+                        }
+                    }
+                };
+
+                if hint_processed {
+                    // handled replay via the hint file
+                    continue;
+                } else {
+                    // the hint file is corrupt, remove it
+                    fs::remove_file(hint_file_path)?;
+                }
+                // else fall through to the data file replay
+            }
+
             let mut buf_reader = BufReader::new(reader_file);
             buf_reader.seek(SeekFrom::Start(0))?;
 
@@ -110,12 +174,13 @@ impl Bitcask {
 
                 let (deserialized, _) = Command::deserialize(&buf)?;
                 match deserialized {
-                    Command::Set { key, .. } => {
+                    Command::Set { ts, key, .. } => {
                         let file_id_copy = *file_id;
                         self.in_mem_index.insert(
                             key.to_vec(),
                             IndexValue {
                                 file_id: file_id_copy,
+                                ts,
                                 offset: start,
                                 len: buf.len(),
                             },
@@ -217,6 +282,7 @@ impl Bitcask {
         //    files (open() deletes them) or renamed files that win over the old ones
         let mut compaction_file_id = self.current_file_id;
         let mut compaction_file_writer_opt: Option<BufWriter<File>> = None;
+        let mut hint_file_writer_opt: Option<BufWriter<File>> = None;
         let mut new_files: HashSet<u64> = HashSet::new();
         let mut ids_to_remove: Vec<u64> = Vec::new();
         let mut dest_offset: u64 = 0;
@@ -230,17 +296,26 @@ impl Bitcask {
                 compaction_file_id += 1;
                 let compaction_file_path =
                     self.dir.join(data_file_name_compaction(compaction_file_id));
+                let hint_file_path = self.dir.join(hint_file_name(compaction_file_id));
 
                 let file = OpenOptions::new()
                     .create(true)
                     .append(true)
                     .open(&compaction_file_path)?;
+                let hint_file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&hint_file_path)?;
                 compaction_file_writer_opt = Some(BufWriter::new(file));
+                hint_file_writer_opt = Some(BufWriter::new(hint_file));
             }
 
             let compaction_file_writer = compaction_file_writer_opt
                 .as_mut()
                 .expect("writer was initialized above");
+            let hint_file_writer = hint_file_writer_opt
+                .as_mut()
+                .expect("hint-file writer was initialized above");
 
             let mut buf_reader = BufReader::new(reader_file);
             buf_reader.seek(SeekFrom::Start(0))?;
@@ -288,21 +363,21 @@ impl Bitcask {
 
                 let (deserialized, _) = Command::deserialize(&buf)?;
                 match deserialized {
-                    Command::Set { key, .. } => {
+                    Command::Set { ts, key, .. } => {
                         match self.in_mem_index.get(key) {
                             Some(index_value) => {
                                 if index_value.file_id == *file_id {
                                     compaction_file_writer.write_all(&buf)?;
                                     let value_offset = dest_offset;
                                     dest_offset = dest_offset + buf.len() as u64;
-                                    self.in_mem_index.insert(
-                                        key.to_vec(),
-                                        IndexValue {
-                                            file_id: compaction_file_id,
-                                            offset: value_offset,
-                                            len: buf.len(),
-                                        },
-                                    );
+                                    let new_index_value = IndexValue {
+                                        file_id: compaction_file_id,
+                                        ts,
+                                        offset: value_offset,
+                                        len: buf.len(),
+                                    };
+                                    hint_file_writer.write_all(&new_index_value.serialize(key))?;
+                                    self.in_mem_index.insert(key.to_vec(), new_index_value);
                                 }
                             }
                             None => {
@@ -316,12 +391,18 @@ impl Bitcask {
                 }
             }
 
+            // flush the compaction file
             compaction_file_writer.flush()?;
             compaction_file_writer.get_ref().sync_all()?;
+            // flush the hint file
+            hint_file_writer.flush()?;
+            hint_file_writer.get_ref().sync_all()?;
+
             new_files.insert(compaction_file_id);
 
             if dest_offset >= self.file_size_threshold {
                 compaction_file_writer_opt = None;
+                hint_file_writer_opt = None;
                 dest_offset = 0;
             }
         }
@@ -334,6 +415,7 @@ impl Bitcask {
             self.readers.insert(id, compacted_file);
         }
 
+        // after compaction, re-open the writer to the new file
         self.handle_file_rotation(compaction_file_id, true)?;
 
         for id in ids_to_remove {
@@ -341,6 +423,12 @@ impl Bitcask {
                 drop(file);
                 let path_to_remove = self.dir.join(data_file_name(id));
                 fs::remove_file(path_to_remove)?;
+
+                // remove associated hint file
+                let hint_path = self.dir.join(hint_file_name(id));
+                if hint_path.exists() {
+                    fs::remove_file(hint_path)?;
+                }
             }
         }
 
@@ -383,6 +471,14 @@ impl KvStore for Bitcask {
                     // file name is not in the expected format, remove it
                     // like old compacted files
                     fs::remove_file(path)?;
+                } else if let Some(id) = file_name
+                    .strip_suffix(".hint")
+                    .and_then(|stem| stem.parse::<u64>().ok())
+                {
+                    // remove the hint file if the corresponding data file is gone
+                    if !fs::exists(dir.join(data_file_name(id)))? {
+                        fs::remove_file(path)?;
+                    }
                 }
                 continue;
             };
@@ -449,6 +545,7 @@ impl KvStore for Bitcask {
 
         let index_value = IndexValue {
             file_id: self.current_file_id,
+            ts,
             offset,
             len: serialized_command.len(),
         };
@@ -528,6 +625,11 @@ fn data_file_name(id: u64) -> String {
     format!("{:06}.data", id)
 }
 
+// name format for the log data files: 000001.hint (6 digits)
+fn hint_file_name(id: u64) -> String {
+    format!("{:06}.hint", id)
+}
+
 fn get_file_id(file_name: &str) -> Option<u64> {
     let stem = file_name.strip_suffix(".data")?;
     stem.parse().ok()
@@ -568,6 +670,136 @@ mod tests {
 
         assert_eq!(bitcask.get("alpha")?, Some("beta".to_owned()));
         assert_eq!(fs::metadata(&log_path)?.len(), valid.len() as u64);
+
+        Ok(())
+    }
+
+    // A hint deliberately mapping a DIFFERENT key ("zeta") to the sealed
+    // record makes hint usage observable: if the hint is loaded, "zeta"
+    // resolves and "alpha" is unknown; if the data file were replayed
+    // instead, it would be the other way around.
+    #[test]
+    fn replay_uses_hint_file_for_sealed_files() -> Result<()> {
+        let dir = tempdir()?;
+
+        let sealed = Command::Set {
+            ts: 1,
+            key: b"alpha",
+            value: b"beta",
+        }
+        .serialize();
+        fs::write(dir.path().join("000001.data"), &sealed)?;
+
+        let active = Command::Set {
+            ts: 2,
+            key: b"gamma",
+            value: b"delta",
+        }
+        .serialize();
+        fs::write(dir.path().join("000002.data"), &active)?;
+
+        let hint = IndexValue {
+            file_id: 1,
+            ts: 1,
+            offset: 0,
+            len: sealed.len(),
+        }
+        .serialize(b"zeta");
+        fs::write(dir.path().join("000001.hint"), &hint)?;
+
+        let mut bitcask = Bitcask::open(Config::new(dir.path()))?;
+
+        assert_eq!(bitcask.get("zeta")?, Some("beta".to_owned()));
+        assert_eq!(bitcask.get("alpha")?, None);
+        assert_eq!(bitcask.get("gamma")?, Some("delta".to_owned()));
+
+        Ok(())
+    }
+
+    // Hint-loaded files take part in later-id-wins ordering like any other
+    // file: a hinted file must override keys replayed from earlier files.
+    #[test]
+    fn hint_of_later_file_overrides_earlier_data_replay() -> Result<()> {
+        let dir = tempdir()?;
+
+        let old = Command::Set {
+            ts: 1,
+            key: b"k",
+            value: b"old",
+        }
+        .serialize();
+        fs::write(dir.path().join("000001.data"), &old)?;
+
+        let new = Command::Set {
+            ts: 2,
+            key: b"k",
+            value: b"new",
+        }
+        .serialize();
+        fs::write(dir.path().join("000002.data"), &new)?;
+        let hint = IndexValue {
+            file_id: 2,
+            ts: 2,
+            offset: 0,
+            len: new.len(),
+        }
+        .serialize(b"k");
+        fs::write(dir.path().join("000002.hint"), &hint)?;
+
+        let active = Command::Set {
+            ts: 3,
+            key: b"other",
+            value: b"x",
+        }
+        .serialize();
+        fs::write(dir.path().join("000003.data"), &active)?;
+
+        let mut bitcask = Bitcask::open(Config::new(dir.path()))?;
+
+        assert_eq!(bitcask.get("k")?, Some("new".to_owned()));
+        assert_eq!(bitcask.get("other")?, Some("x".to_owned()));
+
+        Ok(())
+    }
+
+    #[test]
+    fn torn_hint_file_falls_back_to_data_replay() -> Result<()> {
+        let dir = tempdir()?;
+
+        let sealed = Command::Set {
+            ts: 1,
+            key: b"alpha",
+            value: b"beta",
+        }
+        .serialize();
+        fs::write(dir.path().join("000001.data"), &sealed)?;
+
+        let active = Command::Set {
+            ts: 2,
+            key: b"gamma",
+            value: b"delta",
+        }
+        .serialize();
+        fs::write(dir.path().join("000002.data"), &active)?;
+
+        let mut hint = IndexValue {
+            file_id: 1,
+            ts: 1,
+            offset: 0,
+            len: sealed.len(),
+        }
+        .serialize(b"zeta");
+        hint.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        fs::write(dir.path().join("000001.hint"), &hint)?;
+
+        let mut bitcask = Bitcask::open(Config::new(dir.path()))?;
+
+        assert_eq!(bitcask.get("alpha")?, Some("beta".to_owned()));
+        assert_eq!(bitcask.get("gamma")?, Some("delta".to_owned()));
+        assert!(
+            !fs::exists(dir.path().join("000001.hint"))?,
+            "damaged hint file should be removed during fallback"
+        );
 
         Ok(())
     }

@@ -52,9 +52,9 @@ Groundwork that makes rotation and compaction much easier later.
 
 ## Phase 4 — Hint files
 
-- [ ] After a merge, write a `*.hint` file next to each data file containing
+- [x] After a merge, write a `*.hint` file next to each data file containing
   just `key -> (offset, len, tstamp)`.
-- [ ] On startup, load hints instead of replaying full data files:
+- [x] On startup, load hints instead of replaying full data files:
   startup goes from O(total bytes) to ~O(keys).
 
 ## Phase 5 — Concurrency

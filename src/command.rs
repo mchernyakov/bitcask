@@ -14,8 +14,9 @@
 //! (torn writes) and `Corruption` for records whose bytes don't match
 //! their crc — callers rely on that distinction.
 
+use crate::bytes_util::BytesUtil;
 use crate::{KvsError, Result};
-use std::convert::{TryFrom, TryInto};
+use std::convert::TryFrom;
 use std::io;
 
 /// [u32 crc][u32 body_len] — crc covers body_len and the body.
@@ -92,8 +93,8 @@ impl<'a> Command<'a> {
     pub fn deserialize(buf: &'a [u8]) -> Result<(Self, usize)> {
         let mut cursor = 0;
 
-        let stored_crc = read_u32(buf, &mut cursor)?;
-        let body_len = read_u32(buf, &mut cursor)? as usize;
+        let stored_crc = BytesUtil::read_u32(buf, &mut cursor)?;
+        let body_len = BytesUtil::read_u32(buf, &mut cursor)? as usize;
 
         if buf.len() < HEADER_LEN + body_len {
             return Err(KvsError::Io(io::Error::new(
@@ -108,19 +109,19 @@ impl<'a> Command<'a> {
             return Err(KvsError::Corruption);
         }
 
-        let ts = read_u64(buf, &mut cursor)?;
-        let command = match CommandType::try_from(read_u8(buf, &mut cursor)?)? {
+        let ts = BytesUtil::read_u64(buf, &mut cursor)?;
+        let command = match CommandType::try_from(BytesUtil::read_u8(buf, &mut cursor)?)? {
             CommandType::Set => {
-                let key_len = read_u32(buf, &mut cursor)? as usize;
-                let key = read_bytes(buf, &mut cursor, key_len)?;
-                let value_len = read_u32(buf, &mut cursor)? as usize;
-                let value = read_bytes(buf, &mut cursor, value_len)?;
+                let key_len = BytesUtil::read_u32(buf, &mut cursor)? as usize;
+                let key = BytesUtil::read_bytes(buf, &mut cursor, key_len)?;
+                let value_len = BytesUtil::read_u32(buf, &mut cursor)? as usize;
+                let value = BytesUtil::read_bytes(buf, &mut cursor, value_len)?;
 
                 Command::Set { ts, key, value }
             }
             CommandType::Rm => {
-                let key_len = read_u32(buf, &mut cursor)? as usize;
-                let key = read_bytes(buf, &mut cursor, key_len)?;
+                let key_len = BytesUtil::read_u32(buf, &mut cursor)? as usize;
+                let key = BytesUtil::read_bytes(buf, &mut cursor, key_len)?;
                 Command::Rm { ts, key }
             }
         };
@@ -159,81 +160,6 @@ impl<'a> Command<'a> {
             }
         }
     }
-}
-
-#[inline]
-fn read_u8(buf: &[u8], cursor: &mut usize) -> io::Result<u8> {
-    if *cursor >= buf.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "unexpected end of buffer",
-        ));
-    }
-
-    let value = buf[*cursor];
-    *cursor += 1;
-
-    Ok(value)
-}
-
-#[inline]
-fn read_u32(buf: &[u8], cursor: &mut usize) -> io::Result<u32> {
-    let end = cursor
-        .checked_add(4)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "cursor overflow"))?;
-
-    if end > buf.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "unexpected end of buffer",
-        ));
-    }
-
-    let value = u32::from_le_bytes(buf[*cursor..end].try_into().unwrap());
-
-    *cursor = end;
-
-    Ok(value)
-}
-
-#[inline]
-fn read_u64(buf: &[u8], cursor: &mut usize) -> io::Result<u64> {
-    let end = cursor
-        .checked_add(8)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "cursor overflow"))?;
-
-    if end > buf.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "unexpected end of buffer",
-        ));
-    }
-
-    let value = u64::from_le_bytes(buf[*cursor..end].try_into().unwrap());
-
-    *cursor = end;
-
-    Ok(value)
-}
-
-#[inline]
-fn read_bytes<'a>(buf: &'a [u8], cursor: &mut usize, len: usize) -> io::Result<&'a [u8]> {
-    let end = cursor
-        .checked_add(len)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "length overflow"))?;
-
-    if end > buf.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "unexpected end of buffer",
-        ));
-    }
-
-    let value = &buf[*cursor..end];
-
-    *cursor = end;
-
-    Ok(value)
 }
 
 #[cfg(test)]
