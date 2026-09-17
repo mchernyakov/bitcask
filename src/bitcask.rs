@@ -18,6 +18,57 @@ fn unix_now() -> Result<Duration> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?)
 }
 
+struct MergeOutput {
+    id: u64,
+    data: BufWriter<File>,
+    hint: BufWriter<File>,
+    written: u64,
+}
+
+impl MergeOutput {
+    fn open(dir: &Path, id: u64) -> Result<Self> {
+        let data = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(data_file_name_compaction(id)))?;
+        let hint = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(hint_file_name(id)))?;
+        Ok(MergeOutput {
+            id,
+            data: BufWriter::new(data),
+            hint: BufWriter::new(hint),
+            written: 0,
+        })
+    }
+
+    fn append(&mut self, record: &[u8], key: &[u8], ts: u64) -> Result<IndexValue> {
+        self.data.write_all(record)?;
+        let index_value = IndexValue {
+            file_id: self.id,
+            ts,
+            offset: self.written,
+            len: record.len(),
+        };
+        self.hint.write_all(&index_value.serialize(key))?;
+        self.written += record.len() as u64;
+        Ok(index_value)
+    }
+
+    fn sync(&mut self) -> Result<()> {
+        self.data.flush()?;
+        self.data.get_ref().sync_all()?;
+        self.hint.flush()?;
+        self.hint.get_ref().sync_all()?;
+        Ok(())
+    }
+
+    fn is_full(&self, threshold: u64) -> bool {
+        self.written >= threshold
+    }
+}
+
 pub struct Bitcask {
     // current file
     dir: PathBuf,
@@ -229,44 +280,26 @@ impl Bitcask {
         // 6) rotate the writer to an id above the compacted files, so new writes win on replay
         // 7) remove the old files last: after a crash we either see leftover .compact
         //    files (open() deletes them) or renamed files that win over the old ones
-        let mut compaction_file_id = self.current_file_id;
-        let mut compaction_file_writer_opt: Option<BufWriter<File>> = None;
-        let mut hint_file_writer_opt: Option<BufWriter<File>> = None;
         let mut new_files: HashSet<u64> = HashSet::new();
         let mut ids_to_remove: Vec<u64> = Vec::new();
-        let mut dest_offset: u64 = 0;
 
-        for (file_id, reader_file) in self.readers.iter() {
-            if file_id == &self.current_file_id {
+        let mut output: Option<MergeOutput> = None;
+        let mut next_compaction_file_id = self.current_file_id;
+
+        for (&file_id, reader_file) in &self.readers {
+            if file_id == self.current_file_id {
                 continue;
             }
 
             debug!("compaction: processing file {}", file_id);
 
-            if compaction_file_writer_opt.is_none() {
-                compaction_file_id += 1;
-                let compaction_file_path =
-                    self.dir.join(data_file_name_compaction(compaction_file_id));
-                let hint_file_path = self.dir.join(hint_file_name(compaction_file_id));
-
-                let file = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&compaction_file_path)?;
-                let hint_file = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&hint_file_path)?;
-                compaction_file_writer_opt = Some(BufWriter::new(file));
-                hint_file_writer_opt = Some(BufWriter::new(hint_file));
-            }
-
-            let compaction_file_writer = compaction_file_writer_opt
-                .as_mut()
-                .expect("writer was initialized above");
-            let hint_file_writer = hint_file_writer_opt
-                .as_mut()
-                .expect("hint-file writer was initialized above");
+            let out = match &mut output {
+                Some(out) => out,
+                slot @ None => {
+                    next_compaction_file_id += 1;
+                    slot.insert(MergeOutput::open(&self.dir, next_compaction_file_id)?)
+                }
+            };
 
             let mut buf_reader = BufReader::new(reader_file);
             buf_reader.seek(SeekFrom::Start(0))?;
@@ -277,25 +310,23 @@ impl Bitcask {
 
             loop {
                 match data_file_record_reader.next_record()? {
-                    RecordRead::Record { position: _, bytes } => {
+                    RecordRead::Record { position, bytes } => {
                         let (deserialized, _) = Command::deserialize(&bytes)?;
                         match deserialized {
                             Command::Set { ts, key, .. } => {
                                 match self.in_mem_index.get(key) {
                                     // if the key sits in the index, append to the compaction file
-                                    Some(index_value) if index_value.file_id == *file_id => {
-                                        compaction_file_writer.write_all(&bytes)?;
-                                        let value_offset = dest_offset;
-                                        dest_offset += bytes.len() as u64;
-                                        let new_index_value = IndexValue {
-                                            file_id: compaction_file_id,
-                                            ts,
-                                            offset: value_offset,
-                                            len: bytes.len(),
-                                        };
-                                        hint_file_writer
-                                            .write_all(&new_index_value.serialize(key))?;
+                                    Some(index_value)
+                                        if index_value.file_id == file_id
+                                            && index_value.offset == position =>
+                                    {
+                                        let new_index_value = out.append(&bytes, key, ts)?;
                                         self.in_mem_index.insert(key.to_vec(), new_index_value);
+                                        debug!(
+                                            "compaction: key {} appended to file {}",
+                                            String::from_utf8_lossy(key),
+                                            file_id
+                                        );
                                     }
                                     // key was removed or already re-written elsewhere, do nothing
                                     _ => {}
@@ -309,7 +340,7 @@ impl Bitcask {
                     RecordRead::CleanEof => {
                         // remove the file from the reader's list
                         // we finished processing it
-                        ids_to_remove.push(*file_id);
+                        ids_to_remove.push(file_id);
                         break;
                     }
                     RecordRead::TornTail { .. } => {
@@ -318,19 +349,11 @@ impl Bitcask {
                 }
             }
 
-            // flush the compaction file
-            compaction_file_writer.flush()?;
-            compaction_file_writer.get_ref().sync_all()?;
-            // flush the hint file
-            hint_file_writer.flush()?;
-            hint_file_writer.get_ref().sync_all()?;
+            out.sync()?;
+            new_files.insert(out.id);
 
-            new_files.insert(compaction_file_id);
-
-            if dest_offset >= self.file_size_threshold {
-                compaction_file_writer_opt = None;
-                hint_file_writer_opt = None;
-                dest_offset = 0;
+            if out.is_full(self.file_size_threshold) {
+                output = None;
             }
         }
 
@@ -343,7 +366,7 @@ impl Bitcask {
         }
 
         // after compaction, re-open the writer to the new file
-        self.rotate_to(compaction_file_id + 1)?;
+        self.rotate_to(next_compaction_file_id + 1)?;
 
         for id in ids_to_remove {
             if let Some(file) = self.readers.remove(&id) {
@@ -370,18 +393,27 @@ impl Bitcask {
 
         self.writer.write_all(&serialized_command)?;
 
-        let index_value = IndexValue {
-            file_id: self.current_file_id,
-            ts: command.get_timestamp(),
-            offset,
-            len: serialized_command.len(),
-        };
+        match command {
+            Command::Set { ts, key, value } => {
+                let index_value = IndexValue {
+                    file_id: self.current_file_id,
+                    ts: command.get_timestamp(),
+                    offset,
+                    len: serialized_command.len(),
+                };
 
-        if let Some(old) = self
-            .in_mem_index
-            .insert(command.get_key().to_vec(), index_value)
-        {
-            self.stale_bytes_count += old.len as u64;
+                if let Some(old) = self
+                    .in_mem_index
+                    .insert(command.get_key().to_vec(), index_value)
+                {
+                    self.stale_bytes_count += old.len as u64;
+                }
+            }
+            Command::Rm { ts, key } => {
+                if let Some(old) = self.in_mem_index.remove(*key) {
+                    self.stale_bytes_count += old.len as u64;
+                }
+            }
         }
 
         self.offset += serialized_command.len() as u64;
@@ -680,6 +712,51 @@ mod tests {
 
         assert_eq!(bitcask.get("k")?, Some("new".to_owned()));
         assert_eq!(bitcask.get("other")?, Some("x".to_owned()));
+
+        Ok(())
+    }
+
+    // Crash-recovery shape: a merge output (with hint) is the highest id, so
+    // open() elects it as the active file. The hint must be skipped for the
+    // active file so replay sets the append offset — writes landing after
+    // this reopen must survive the next one.
+    #[test_log::test]
+    fn writes_after_reopen_onto_compacted_file_survive() -> Result<()> {
+        let dir = tempdir()?;
+
+        let sealed = Command::Set {
+            ts: 1,
+            key: b"a",
+            value: b"1",
+        }
+        .serialize();
+        fs::write(dir.path().join("000001.data"), &sealed)?;
+
+        let compacted = Command::Set {
+            ts: 2,
+            key: b"b",
+            value: b"2",
+        }
+        .serialize();
+        fs::write(dir.path().join("000002.data"), &compacted)?;
+        let hint = IndexValue {
+            file_id: 2,
+            ts: 2,
+            offset: 0,
+            len: compacted.len(),
+        }
+        .serialize(b"b");
+        fs::write(dir.path().join("000002.hint"), &hint)?;
+
+        let mut bitcask = Bitcask::open(Config::new(dir.path()))?;
+        bitcask.set("c", "3")?;
+        assert_eq!(bitcask.get("c")?, Some("3".to_owned()));
+        drop(bitcask);
+
+        let mut bitcask = Bitcask::open(Config::new(dir.path()))?;
+        assert_eq!(bitcask.get("a")?, Some("1".to_owned()));
+        assert_eq!(bitcask.get("b")?, Some("2".to_owned()));
+        assert_eq!(bitcask.get("c")?, Some("3".to_owned()));
 
         Ok(())
     }

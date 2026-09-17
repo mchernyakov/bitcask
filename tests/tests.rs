@@ -1,13 +1,12 @@
 //! Adapted from the PingCAP Talent Plan project-2 test suite
-//! (courses/rust/projects/project-2/tests/tests.rs).
+//! (courses/rust/projects/project-2/tests/tests.rs), extended with our own
+//! tests for durability policies, rotation, compaction, and hint files.
 //!
 //! Adaptations to this implementation:
-//! - The store is `Bitcask` (implementing the `KvStore` trait) instead of a
-//!   `KvStore` struct, and the API takes `&str` instead of `String`.
-//! - The CLI tests expect a batch CLI (`kvs get <KEY>` etc.), but the current
-//!   `kvs` binary is an interactive REPL, so they are `#[ignore]`d until a
-//!   batch mode exists. Run them with `cargo test -- --ignored`.
-//! - The `compaction` test is expected to fail until compaction is implemented.
+//! - The store is `Bitcask` (implementing the `KvStore` trait), opened with a
+//!   `Config`, and the API takes `&str` instead of `String`.
+//! - The original CLI tests were dropped: the `kvs` binary is an interactive
+//!   REPL, not the batch CLI the upstream suite drives.
 
 use kvs::{Bitcask, Config, DurabilityPolicy, KvStore, Result};
 use tempfile::TempDir;
@@ -127,6 +126,170 @@ fn remove_key() -> Result<()> {
     store.set("key1", "value1")?;
     assert!(store.remove("key1").is_ok());
     assert_eq!(store.get("key1")?, None);
+    Ok(())
+}
+
+#[test_log::test]
+fn removed_key_stays_removed_after_reopen() -> Result<()> {
+    let temp_dir = TempDir::new().expect("unable to create temporary working directory");
+    let mut store = Bitcask::open(Config::new(temp_dir.path()))?;
+
+    store.set("key1", "value1")?;
+    store.set("key2", "value2")?;
+    store.remove("key1")?;
+
+    drop(store);
+    let mut store = Bitcask::open(Config::new(temp_dir.path()))?;
+    assert_eq!(store.get("key1")?, None);
+    assert_eq!(store.get("key2")?, Some("value2".to_owned()));
+
+    Ok(())
+}
+
+// A removed key whose Set record still sits in a sealed file must not be
+// resurrected by the merge dropping its tombstone.
+#[test_log::test]
+fn remove_then_compaction_does_not_resurrect() -> Result<()> {
+    let temp_dir = TempDir::new().expect("unable to create temporary working directory");
+    let config = || Config {
+        file_size_threshold: 2048,
+        compaction_threshold: 2048,
+        ..Config::new(temp_dir.path())
+    };
+    let mut store = Bitcask::open(config())?;
+
+    store.set("victim", "resurrect-me-not")?;
+
+    let filler = "v".repeat(32);
+    for i in 0..100 {
+        store.set(&format!("filler{}", i), &filler)?;
+    }
+    store.remove("victim")?;
+    for i in 0..100 {
+        store.set(&format!("filler{}", i), &filler)?;
+    }
+
+    assert_eq!(store.get("victim")?, None);
+
+    drop(store);
+    let mut store = Bitcask::open(config())?;
+    assert_eq!(store.get("victim")?, None);
+    assert_eq!(store.get("filler0")?, Some(filler.clone()));
+
+    Ok(())
+}
+
+// A single record may legally exceed the rotation threshold.
+#[test_log::test]
+fn record_larger_than_file_threshold_roundtrips() -> Result<()> {
+    let temp_dir = TempDir::new().expect("unable to create temporary working directory");
+    let config = || Config {
+        file_size_threshold: 1024,
+        ..Config::new(temp_dir.path())
+    };
+    let mut store = Bitcask::open(config())?;
+
+    let big = "x".repeat(4096);
+    store.set("big", &big)?;
+    store.set("small", "y")?;
+    assert_eq!(store.get("big")?, Some(big.clone()));
+    assert_eq!(store.get("small")?, Some("y".to_owned()));
+
+    drop(store);
+    let mut store = Bitcask::open(config())?;
+    assert_eq!(store.get("big")?, Some(big));
+    assert_eq!(store.get("small")?, Some("y".to_owned()));
+
+    Ok(())
+}
+
+#[test_log::test]
+fn empty_key_and_empty_value_roundtrip() -> Result<()> {
+    let temp_dir = TempDir::new().expect("unable to create temporary working directory");
+    let mut store = Bitcask::open(Config::new(temp_dir.path()))?;
+
+    store.set("", "empty-key")?;
+    store.set("k", "")?;
+    assert_eq!(store.get("")?, Some("empty-key".to_owned()));
+    assert_eq!(store.get("k")?, Some("".to_owned()));
+
+    drop(store);
+    let mut store = Bitcask::open(Config::new(temp_dir.path()))?;
+    assert_eq!(store.get("")?, Some("empty-key".to_owned()));
+    assert_eq!(store.get("k")?, Some("".to_owned()));
+    store.remove("")?;
+    assert_eq!(store.get("")?, None);
+
+    Ok(())
+}
+
+// Random ops against an in-memory oracle, with thresholds small enough that
+// rotation, compaction, and hint files all fire organically, and periodic
+// reopens to exercise replay and hint loading. Deterministic seed.
+#[test_log::test]
+fn random_ops_match_in_memory_model() -> Result<()> {
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+    }
+
+    let temp_dir = TempDir::new().expect("unable to create temporary working directory");
+    let config = || Config {
+        file_size_threshold: 2048,
+        compaction_threshold: 2048,
+        ..Config::new(temp_dir.path())
+    };
+
+    let mut store = Bitcask::open(config())?;
+    let mut model: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut rng = Rng(0xDEAD_BEEF);
+
+    for step in 0..3000 {
+        let key = format!("key{}", rng.next() % 50);
+        match rng.next() % 10 {
+            0..=6 => {
+                let value = format!("value{}", rng.next() % 1000);
+                store.set(&key, &value)?;
+                model.insert(key, value);
+            }
+            7..=8 => {
+                let expected = model.remove(&key);
+                let result = store.remove(&key);
+                assert_eq!(
+                    result.is_ok(),
+                    expected.is_some(),
+                    "step {step}: remove({key}) disagreed with the model"
+                );
+            }
+            _ => {
+                assert_eq!(
+                    store.get(&key)?,
+                    model.get(&key).cloned(),
+                    "step {step}: get({key}) disagreed with the model"
+                );
+            }
+        }
+
+        if step % 1000 == 999 {
+            drop(store);
+            store = Bitcask::open(config())?;
+            for (k, v) in &model {
+                assert_eq!(
+                    store.get(k)?.as_deref(),
+                    Some(v.as_str()),
+                    "after reopen at step {step}: lost {k}"
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 

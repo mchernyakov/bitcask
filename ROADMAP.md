@@ -23,7 +23,6 @@ Groundwork that makes rotation and compaction much easier later.
   a write buffer is added.
 - [x] **Explicit durability policy** instead of "sync once in `Drop`":
   sync-on-every-put vs. sync-on-interval vs. OS-decides, as a config option.
-  See [Buffering notes](#buffering-notes) below.
 
 ## Phase 2 — File rotation
 
@@ -72,35 +71,30 @@ Bitcask's model: exactly one writer, many readers.
   startup with vs. without hint files.
 - [ ] Turns the buffering trade-offs into visible numbers.
 
+## Future optimizations (backlog)
+
+Ideas noted along the way. Measure first (Phase 6), then decide — none of
+these are worth doing on a hunch.
+
+- [ ] Reusable record buffer: `RecordReader::next_record` lends `&[u8]` into
+  an internal buffer instead of allocating a `Vec` per record (replay and
+  merge touch every record). Lending pattern — can't be a std `Iterator`.
+- [ ] Rebuild `stale_bytes_count` fully on startup: replay counts tombstones
+  but not overwrites, so a reopened store under-counts garbage and compacts
+  later than it should.
+- [ ] Per-file stale counters: compact only garbage-heavy files instead of
+  rewriting every sealed file on each merge.
+- [ ] Write hint files on rotation too (not only during merges), so every
+  sealed file starts up at O(live keys).
+- [ ] Fewer fsyncs during merge: sync once per finished output file instead
+  of once per source file.
+- [ ] Value-only reads in `get` (keydir stores value position/length like the
+  paper) — halves read I/O for large keys, but gives up the per-read CRC
+  check over the whole record. Decide with benchmark numbers in hand.
+- [ ] `MAX_RECORD_SIZE` sanity cap, enforced in `set` and checked on read
+  (defense-in-depth leftover from Phase 1).
+
 ## Possible continuations
 
 Network server/client, thread pools, async — the later PingCAP Talent Plan
 projects are a natural extension after Phase 5.
-
----
-
-## Buffering notes
-
-Three layers where data sits between `set()` and the disk platter:
-
-1. **Application buffer** (`BufWriter`): currently every `set` is one
-   `write()` syscall. A syscall costs ~1µs regardless of size, so for small
-   entries syscall overhead dominates. `BufWriter` batches small writes into
-   one big syscall — this is where buffering is *needed* on the write path.
-2. **Kernel page cache**: when `write()` returns, data is **not on disk** —
-   it's in kernel memory, flushed whenever the OS decides. This is buffering
-   inherited without asking: writes feel fast, but power loss can eat
-   acknowledged writes. Only `sync_all()` (fsync) forces durability. Every
-   layer of buffering trades crash-durability for throughput — the point is
-   to *choose* the trade, not inherit it.
-3. **Read path**: `replay()` does two syscalls per record — brutal over a
-   large log. Sequential scans (replay, merge) want `BufReader` / large
-   chunks. Random-access `get`s are the opposite: a seek throws the
-   `BufReader` buffer away, so the right tool is `read_exact_at` with a known
-   length — no buffer at all.
-
-**Trap:** with a `BufWriter` on the active file, a freshly-written value lives
-in the process buffer, not the file — a `get` through a separate read handle
-would miss it. Flush before reads can see the tail (or serve the tail from the
-buffer by checking offsets). This is why split handles + explicit flush policy
-(Phase 1) come before adding the buffer.
