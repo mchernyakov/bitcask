@@ -121,7 +121,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[test_log::test]
     fn roundtrip() {
         let (bytes, iv) = sample();
         let (key, decoded, used) = IndexValue::deserialize(&bytes, iv.file_id).unwrap();
@@ -130,7 +130,7 @@ mod tests {
         assert_eq!(used, bytes.len());
     }
 
-    #[test]
+    #[test_log::test]
     fn file_id_comes_from_the_caller_not_the_record() {
         let (bytes, iv) = sample();
         let (_, decoded, _) = IndexValue::deserialize(&bytes, 42).unwrap();
@@ -140,7 +140,7 @@ mod tests {
         assert_eq!(decoded.len, iv.len);
     }
 
-    #[test]
+    #[test_log::test]
     fn roundtrip_empty_key_and_extreme_values() {
         let iv = IndexValue {
             file_id: u64::MAX,
@@ -155,7 +155,7 @@ mod tests {
         assert_eq!(used, bytes.len());
     }
 
-    #[test]
+    #[test_log::test]
     fn deserialize_consumes_exactly_one_record() {
         let first = IndexValue {
             file_id: 1,
@@ -184,7 +184,7 @@ mod tests {
         assert_eq!(first_len + used, buf.len());
     }
 
-    #[test]
+    #[test_log::test]
     fn every_single_bit_flip_is_rejected() {
         let (bytes, _) = sample();
         for byte_idx in 0..bytes.len() {
@@ -199,14 +199,14 @@ mod tests {
         }
     }
 
-    #[test]
+    #[test_log::test]
     fn corrupted_crc_is_corruption() {
         let (mut bytes, _) = sample();
         bytes[0] ^= 0xFF;
         assert_corruption(&bytes);
     }
 
-    #[test]
+    #[test_log::test]
     fn truncated_buffer_is_eof_not_corruption() {
         let (bytes, _) = sample();
         for prefix_len in 0..bytes.len() {
@@ -214,7 +214,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[test_log::test]
     fn valid_crc_but_inconsistent_key_len_is_corruption() {
         let (mut bytes, _) = sample();
 

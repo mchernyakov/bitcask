@@ -1,0 +1,4 @@
+[env]
+# Default log level for `cargo test` / `cargo run`; a RUST_LOG set in the
+# shell still takes precedence.
+RUST_LOG = "kvs=debug"

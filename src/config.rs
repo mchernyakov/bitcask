@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 const COMPACTION_THRESHOLD: u64 = 1 << 20; // 1 MB
 const FILE_SIZE_THRESHOLD: u64 = 1 << 20; // 1 MB
-const FLUSH_THRESHOLD_MILLIS: u64 = 1 * 1000; // 1 second
+const FLUSH_THRESHOLD_MILLIS: u64 = 1000; // 1 second
 
 pub struct Config {
     pub dir: PathBuf,

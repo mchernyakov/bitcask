@@ -13,7 +13,7 @@ use kvs::{Bitcask, Config, DurabilityPolicy, KvStore, Result};
 use tempfile::TempDir;
 use walkdir::WalkDir;
 
-#[test]
+#[test_log::test]
 fn set_then_get_with_sync_on_every_put() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
     let mut store = Bitcask::open(Config {
@@ -34,7 +34,7 @@ fn set_then_get_with_sync_on_every_put() -> Result<()> {
     Ok(())
 }
 
-#[test]
+#[test_log::test]
 fn set_then_get_with_sync_on_interval() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
     let mut store = Bitcask::open(Config {
@@ -54,7 +54,7 @@ fn set_then_get_with_sync_on_interval() -> Result<()> {
 }
 
 // Should get previously stored value.
-#[test]
+#[test_log::test]
 fn get_stored_value() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
     let mut store = Bitcask::open(Config::new(temp_dir.path()))?;
@@ -75,7 +75,7 @@ fn get_stored_value() -> Result<()> {
 }
 
 // Should overwrite existent value.
-#[test]
+#[test_log::test]
 fn overwrite_value() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
     let mut store = Bitcask::open(Config::new(temp_dir.path()))?;
@@ -96,7 +96,7 @@ fn overwrite_value() -> Result<()> {
 }
 
 // Should get `None` when getting a non-existent key.
-#[test]
+#[test_log::test]
 fn get_non_existent_value() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
     let mut store = Bitcask::open(Config::new(temp_dir.path()))?;
@@ -112,7 +112,7 @@ fn get_non_existent_value() -> Result<()> {
     Ok(())
 }
 
-#[test]
+#[test_log::test]
 fn remove_non_existent_key() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
     let mut store = Bitcask::open(Config::new(temp_dir.path()))?;
@@ -120,7 +120,7 @@ fn remove_non_existent_key() -> Result<()> {
     Ok(())
 }
 
-#[test]
+#[test_log::test]
 fn remove_key() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
     let mut store = Bitcask::open(Config::new(temp_dir.path()))?;
@@ -132,7 +132,7 @@ fn remove_key() -> Result<()> {
 
 // Writing more than one file's worth of data must roll over into new data
 // files, and every value must survive a reopen from the multi-file state.
-#[test]
+#[test_log::test]
 fn rotation_splits_log_into_multiple_files() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
     let mut store = Bitcask::open(Config {
@@ -177,7 +177,7 @@ fn rotation_splits_log_into_multiple_files() -> Result<()> {
 // overwritten in the still-active file must keep the NEW value across reopen:
 // replay is later-id-wins, so the active writer has to rotate above the
 // compaction outputs before accepting further writes.
-#[test]
+#[test_log::test]
 fn overwrite_after_compaction_survives_reopen() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
     let mut store = Bitcask::open(Config {
@@ -212,7 +212,7 @@ fn overwrite_after_compaction_survives_reopen() -> Result<()> {
 
 // Every compaction output gets a sibling hint file (000004.data -> 000004.hint)
 // describing its records, and no hint file may outlive its data file.
-#[test]
+#[test_log::test]
 fn merge_writes_hint_files_next_to_outputs() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
     let mut store = Bitcask::open(Config {
@@ -258,7 +258,7 @@ fn merge_writes_hint_files_next_to_outputs() -> Result<()> {
 
 // Hint files are a startup optimization: damaged or orphaned ones must never
 // brick open() or corrupt the recovered data.
-#[test]
+#[test_log::test]
 fn open_survives_corrupt_and_orphan_hint_files() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
 
@@ -312,7 +312,7 @@ fn open_survives_corrupt_and_orphan_hint_files() -> Result<()> {
 
 // Loading the keydir from hints and rebuilding it by replay must agree, and
 // a successful hint load must not consume the hint files.
-#[test]
+#[test_log::test]
 fn reopen_from_hints_matches_replay_from_data() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
     let config = || Config {
@@ -374,7 +374,7 @@ fn reopen_from_hints_matches_replay_from_data() -> Result<()> {
 
 // open() cleans up leftover .data.compact temp files from a crashed merge,
 // but must not touch any other file living in the directory.
-#[test]
+#[test_log::test]
 fn open_removes_compact_leftovers_but_keeps_foreign_files() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
     let foreign = temp_dir.path().join("notes.txt");
@@ -398,7 +398,7 @@ fn open_removes_compact_leftovers_but_keeps_foreign_files() -> Result<()> {
 
 // Insert data until total size of the directory decreases.
 // Test data correctness after compaction.
-#[test]
+#[test_log::test]
 fn compaction() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
     let mut store = Bitcask::open(Config::new(temp_dir.path()))?;

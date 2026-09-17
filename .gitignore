@@ -5,3 +5,6 @@ target/
 .DS_Store
 .junie/
 .claude/
+.data
+.hint
+/kvs

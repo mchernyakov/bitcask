@@ -1,17 +1,18 @@
-use crate::command::{Command, HEADER_LEN};
+use crate::command::Command;
 use crate::config::Config;
 use crate::index_value::IndexValue;
 use crate::kvstore::KvStore;
 use crate::policy::DurabilityPolicy;
+use crate::record_reader::{RecordRead, RecordReader};
 use crate::{KvsError, Result};
+use log::debug;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs;
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::{fs, io};
-use tracing::debug;
 
 fn unix_now() -> Result<Duration> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?)
@@ -56,50 +57,27 @@ impl Bitcask {
             let hint_file_path = self.dir.join(hint_file_name(file_id));
             if (file_id != self.current_file_id) && fs::exists(&hint_file_path)? {
                 let hint_file = OpenOptions::new().read(true).open(&hint_file_path)?;
-                let mut hint_reader = BufReader::new(hint_file);
+                let hint_reader = BufReader::new(hint_file);
                 let hint_file_len = hint_reader.get_ref().metadata()?.len();
-
-                let mut position = 0;
+                let mut hint_record_reader = RecordReader::new(hint_reader, hint_file_len);
 
                 let hint_processed = loop {
-                    let mut header = [0u8; HEADER_LEN];
-                    match hint_reader.read_exact(&mut header) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                            break position == hint_file_len;
+                    match hint_record_reader.next_record()? {
+                        RecordRead::Record { position: _, bytes } => {
+                            match IndexValue::deserialize(&bytes, file_id) {
+                                Ok((key, value, _)) => {
+                                    self.in_mem_index.insert(key.to_vec(), value);
+                                    debug!("replayed hint: {:?}", key);
+                                }
+                                Err(_) => {
+                                    break false;
+                                }
+                            }
                         }
-                        Err(e) => return Err(e.into()),
-                    }
-
-                    let body_len = Command::body_len(&header);
-
-                    let remaining = hint_file_len - position - HEADER_LEN as u64;
-                    if body_len as u64 > remaining {
-                        debug!(
-                            "hint file is corrupt, remaining: {}, body_len: {}",
-                            remaining, body_len
-                        );
-                        break false;
-                    }
-
-                    let mut buf = vec![0u8; HEADER_LEN + body_len];
-                    buf[..HEADER_LEN].copy_from_slice(&header);
-
-                    position = position + HEADER_LEN as u64 + body_len as u64;
-
-                    match hint_reader.read_exact(&mut buf[HEADER_LEN..]) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                            break false;
+                        RecordRead::CleanEof => {
+                            break true;
                         }
-                        Err(e) => return Err(e.into()),
-                    }
-
-                    match IndexValue::deserialize(&buf, file_id) {
-                        Ok((key, value, _)) => {
-                            self.in_mem_index.insert(key.to_vec(), value);
-                        }
-                        Err(_) => {
+                        RecordRead::TornTail { position: _ } => {
                             break false;
                         }
                     }
@@ -118,70 +96,48 @@ impl Bitcask {
             let mut buf_reader = BufReader::new(reader_file);
             buf_reader.seek(SeekFrom::Start(0))?;
 
-            let file_len = reader_file.metadata()?.len();
+            let data_file_len = reader_file.metadata()?.len();
             self.offset = 0;
 
+            let mut data_file_record_reader = RecordReader::new(buf_reader, data_file_len);
+
             loop {
-                let start = self.offset;
-
-                let mut header = [0u8; HEADER_LEN];
-                match buf_reader.read_exact(&mut header) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                    Err(e) => return Err(e.into()),
-                }
-
-                let body_len = Command::body_len(&header);
-
-                let remaining = file_len - start - HEADER_LEN as u64;
-                if body_len as u64 > remaining {
-                    return if file_id == self.current_file_id {
-                        self.writer.get_ref().set_len(start)?;
-                        self.offset = start;
-                        Ok(())
-                    } else {
-                        Err(KvsError::Corruption)
-                    };
-                }
-
-                let mut buf = vec![0u8; HEADER_LEN + body_len];
-                buf[..HEADER_LEN].copy_from_slice(&header);
-
-                match buf_reader.read_exact(&mut buf[HEADER_LEN..]) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                        if file_id == self.current_file_id {
-                            self.writer.get_ref().set_len(start)?;
-                            self.offset = start;
-                            return Ok(());
-                        } else {
-                            return Err(KvsError::Corruption);
+                match data_file_record_reader.next_record()? {
+                    RecordRead::Record { position, bytes } => {
+                        let (deserialized, _) = Command::deserialize(&bytes)?;
+                        match deserialized {
+                            Command::Set { ts, key, .. } => {
+                                let file_id_copy = file_id;
+                                self.in_mem_index.insert(
+                                    key.to_vec(),
+                                    IndexValue {
+                                        file_id: file_id_copy,
+                                        ts,
+                                        offset: position,
+                                        len: bytes.len(),
+                                    },
+                                );
+                                debug!("replayed SET: {:?}", deserialized);
+                            }
+                            Command::Rm { key, .. } => {
+                                self.stale_bytes_count += bytes.len() as u64;
+                                self.in_mem_index.remove(key);
+                                debug!("replayed RM: {:?}", deserialized);
+                            }
                         }
+                        self.offset += bytes.len() as u64;
                     }
-                    Err(e) => return Err(e.into()),
-                }
-
-                let (deserialized, _) = Command::deserialize(&buf)?;
-                match deserialized {
-                    Command::Set { ts, key, .. } => {
-                        let file_id_copy = file_id;
-                        self.in_mem_index.insert(
-                            key.to_vec(),
-                            IndexValue {
-                                file_id: file_id_copy,
-                                ts,
-                                offset: start,
-                                len: buf.len(),
-                            },
-                        );
-                    }
-                    Command::Rm { key, .. } => {
-                        self.stale_bytes_count = self.stale_bytes_count + buf.len() as u64;
-                        self.in_mem_index.remove(key);
+                    RecordRead::CleanEof => break,
+                    RecordRead::TornTail { position } => {
+                        return if file_id == self.current_file_id {
+                            self.writer.get_ref().set_len(position)?;
+                            self.offset = position;
+                            Ok(())
+                        } else {
+                            Err(KvsError::Corruption)
+                        };
                     }
                 }
-
-                self.offset += buf.len() as u64;
             }
         }
 
@@ -189,11 +145,9 @@ impl Bitcask {
     }
 
     fn ensure_flushed(&mut self, file_id: u64) -> Result<()> {
-        if file_id == self.current_file_id {
-            if self.flushed_offset < self.offset {
-                self.writer.flush()?;
-                self.flushed_offset = self.offset;
-            }
+        if file_id == self.current_file_id && self.flushed_offset < self.offset {
+            self.writer.flush()?;
+            self.flushed_offset = self.offset;
         }
         Ok(())
     }
@@ -261,6 +215,11 @@ impl Bitcask {
             return Ok(());
         }
 
+        debug!(
+            "compaction triggered, stale bytes: {}",
+            self.stale_bytes_count
+        );
+
         // 1) walk on every sealed file, skip the active one
         // 2) parse entry: if it's SET -> check whether it's still in the index
         // 3) if it's in the index -> append to the compaction file, update the index
@@ -281,6 +240,8 @@ impl Bitcask {
             if file_id == &self.current_file_id {
                 continue;
             }
+
+            debug!("compaction: processing file {}", file_id);
 
             if compaction_file_writer_opt.is_none() {
                 compaction_file_id += 1;
@@ -311,67 +272,48 @@ impl Bitcask {
             buf_reader.seek(SeekFrom::Start(0))?;
 
             let file_len = reader_file.metadata()?.len();
-            let mut src_offset: u64 = 0;
+
+            let mut data_file_record_reader = RecordReader::new(buf_reader, file_len);
 
             loop {
-                let mut header = [0u8; HEADER_LEN];
-                match buf_reader.read_exact(&mut header) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                match data_file_record_reader.next_record()? {
+                    RecordRead::Record { position: _, bytes } => {
+                        let (deserialized, _) = Command::deserialize(&bytes)?;
+                        match deserialized {
+                            Command::Set { ts, key, .. } => {
+                                match self.in_mem_index.get(key) {
+                                    // if the key sits in the index, append to the compaction file
+                                    Some(index_value) if index_value.file_id == *file_id => {
+                                        compaction_file_writer.write_all(&bytes)?;
+                                        let value_offset = dest_offset;
+                                        dest_offset += bytes.len() as u64;
+                                        let new_index_value = IndexValue {
+                                            file_id: compaction_file_id,
+                                            ts,
+                                            offset: value_offset,
+                                            len: bytes.len(),
+                                        };
+                                        hint_file_writer
+                                            .write_all(&new_index_value.serialize(key))?;
+                                        self.in_mem_index.insert(key.to_vec(), new_index_value);
+                                    }
+                                    // key was removed or already re-written elsewhere, do nothing
+                                    _ => {}
+                                }
+                            }
+                            Command::Rm { .. } => {
+                                // do nothing, the index is already updated
+                            }
+                        }
+                    }
+                    RecordRead::CleanEof => {
                         // remove the file from the reader's list
                         // we finished processing it
                         ids_to_remove.push(*file_id);
                         break;
                     }
-                    Err(e) => return Err(e.into()),
-                }
-
-                let body_len = Command::body_len(&header);
-
-                let remaining = file_len - src_offset - HEADER_LEN as u64;
-                if body_len as u64 > remaining {
-                    return Err(KvsError::Corruption);
-                }
-
-                let mut buf = vec![0u8; HEADER_LEN + body_len];
-                buf[..HEADER_LEN].copy_from_slice(&header);
-
-                match buf_reader.read_exact(&mut buf[HEADER_LEN..]) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    RecordRead::TornTail { .. } => {
                         return Err(KvsError::Corruption);
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-
-                src_offset = src_offset + HEADER_LEN as u64 + body_len as u64;
-
-                let (deserialized, _) = Command::deserialize(&buf)?;
-                match deserialized {
-                    Command::Set { ts, key, .. } => {
-                        match self.in_mem_index.get(key) {
-                            Some(index_value) => {
-                                if index_value.file_id == *file_id {
-                                    compaction_file_writer.write_all(&buf)?;
-                                    let value_offset = dest_offset;
-                                    dest_offset = dest_offset + buf.len() as u64;
-                                    let new_index_value = IndexValue {
-                                        file_id: compaction_file_id,
-                                        ts,
-                                        offset: value_offset,
-                                        len: buf.len(),
-                                    };
-                                    hint_file_writer.write_all(&new_index_value.serialize(key))?;
-                                    self.in_mem_index.insert(key.to_vec(), new_index_value);
-                                }
-                            }
-                            None => {
-                                // key was removed, do nothing
-                            }
-                        }
-                    }
-                    Command::Rm { .. } => {
-                        // do nothing, the index is already updated
                     }
                 }
             }
@@ -462,7 +404,7 @@ impl KvStore for Bitcask {
         let mut read_handlers = BTreeMap::new();
         let mut max_id: Option<u64> = None;
 
-        for entry in fs::read_dir(&dir_path)? {
+        for entry in fs::read_dir(dir_path)? {
             let entry = entry?;
             let path = entry.path();
 
@@ -620,7 +562,7 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    #[test]
+    #[test_log::test]
     fn replay_ignores_truncated_tail() -> Result<()> {
         let dir = tempdir()?;
         let log_path = dir.path().join("000001.data");
@@ -658,7 +600,7 @@ mod tests {
     // record makes hint usage observable: if the hint is loaded, "zeta"
     // resolves and "alpha" is unknown; if the data file were replayed
     // instead, it would be the other way around.
-    #[test]
+    #[test_log::test]
     fn replay_uses_hint_file_for_sealed_files() -> Result<()> {
         let dir = tempdir()?;
 
@@ -698,7 +640,7 @@ mod tests {
 
     // Hint-loaded files take part in later-id-wins ordering like any other
     // file: a hinted file must override keys replayed from earlier files.
-    #[test]
+    #[test_log::test]
     fn hint_of_later_file_overrides_earlier_data_replay() -> Result<()> {
         let dir = tempdir()?;
 
@@ -742,7 +684,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[test_log::test]
     fn torn_hint_file_falls_back_to_data_replay() -> Result<()> {
         let dir = tempdir()?;
 

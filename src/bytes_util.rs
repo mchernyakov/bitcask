@@ -81,7 +81,7 @@ mod tests {
     use super::*;
     use std::io::ErrorKind;
 
-    #[test]
+    #[test_log::test]
     fn reads_advance_cursor_in_order() {
         let mut buf = Vec::new();
         buf.push(7u8);
@@ -100,7 +100,7 @@ mod tests {
         assert_eq!(cursor, buf.len());
     }
 
-    #[test]
+    #[test_log::test]
     fn values_are_little_endian() {
         let buf = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
 
@@ -114,7 +114,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[test_log::test]
     fn short_buffer_is_eof_and_cursor_is_untouched() {
         let buf = [0u8; 3];
 
@@ -137,7 +137,7 @@ mod tests {
         assert_eq!(cursor, buf.len());
     }
 
-    #[test]
+    #[test_log::test]
     fn zero_length_read_bytes_is_empty() {
         let buf = [1u8, 2];
         let mut cursor = 1;
@@ -145,7 +145,7 @@ mod tests {
         assert_eq!(cursor, 1);
     }
 
-    #[test]
+    #[test_log::test]
     fn overflowing_cursor_is_invalid_data_not_panic() {
         let buf = [0u8; 8];
 

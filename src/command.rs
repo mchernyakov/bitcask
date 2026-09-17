@@ -213,7 +213,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[test_log::test]
     fn command_serde_roundtrip() {
         let set = Command::Set {
             ts: 42,
@@ -235,7 +235,7 @@ mod tests {
         assert_eq!(rm_used, rm_bytes.len());
     }
 
-    #[test]
+    #[test_log::test]
     fn roundtrip_timestamp_extremes() {
         for ts in [0, 1, u64::MAX] {
             let cmd = Command::Set {
@@ -249,7 +249,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[test_log::test]
     fn roundtrip_empty_key_and_value() {
         let set = Command::Set {
             ts: 1,
@@ -268,7 +268,7 @@ mod tests {
         assert_eq!(used, bytes.len());
     }
 
-    #[test]
+    #[test_log::test]
     fn deserialize_consumes_exactly_one_record() {
         let first = Command::Set {
             ts: 1,
@@ -293,7 +293,7 @@ mod tests {
         assert_eq!(first_len + used, buf.len());
     }
 
-    #[test]
+    #[test_log::test]
     fn every_single_bit_flip_is_rejected() {
         let bytes = sample_set();
         for byte_idx in 0..bytes.len() {
@@ -308,14 +308,14 @@ mod tests {
         }
     }
 
-    #[test]
+    #[test_log::test]
     fn corrupted_crc_field_is_corruption() {
         let mut bytes = sample_set();
         bytes[0] ^= 0xFF;
         assert_corruption(&bytes);
     }
 
-    #[test]
+    #[test_log::test]
     fn corrupted_body_is_corruption() {
         let mut bytes = sample_set();
         let last = bytes.len() - 1;
@@ -327,7 +327,7 @@ mod tests {
         assert_corruption(&bytes);
     }
 
-    #[test]
+    #[test_log::test]
     fn truncated_buffer_is_eof_not_corruption() {
         let bytes = sample_set();
         for prefix_len in 0..bytes.len() {
@@ -335,14 +335,14 @@ mod tests {
         }
     }
 
-    #[test]
+    #[test_log::test]
     fn oversized_body_len_is_eof() {
         let mut bytes = sample_set();
         bytes[CRC_LEN..HEADER_LEN].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eof(&bytes);
     }
 
-    #[test]
+    #[test_log::test]
     fn unknown_command_type_with_valid_crc_is_rejected() {
         let mut body = Vec::new();
         body.extend_from_slice(&42u64.to_le_bytes());
@@ -357,14 +357,14 @@ mod tests {
         }
     }
 
-    #[test]
+    #[test_log::test]
     fn body_len_reads_little_endian_length_field() {
         let mut header = [0u8; HEADER_LEN];
         header[CRC_LEN..].copy_from_slice(&0x0102_0304u32.to_le_bytes());
         assert_eq!(Command::body_len(&header), 0x0102_0304);
     }
 
-    #[test]
+    #[test_log::test]
     fn body_len_ignores_crc_bytes() {
         let mut header = [0u8; HEADER_LEN];
         header[CRC_LEN..].copy_from_slice(&7u32.to_le_bytes());
@@ -374,7 +374,7 @@ mod tests {
         assert_eq!(Command::body_len(&header), 7);
     }
 
-    #[test]
+    #[test_log::test]
     fn body_len_boundary_values() {
         let mut header = [0u8; HEADER_LEN];
         assert_eq!(Command::body_len(&header), 0);
@@ -383,7 +383,7 @@ mod tests {
         assert_eq!(Command::body_len(&header), u32::MAX as usize);
     }
 
-    #[test]
+    #[test_log::test]
     fn body_len_matches_serialized_record() {
         for cmd in [
             Command::Set {
@@ -402,7 +402,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[test_log::test]
     fn valid_crc_but_inconsistent_inner_lengths_is_corruption() {
         let mut body = Vec::new();
         body.extend_from_slice(&42u64.to_le_bytes());
