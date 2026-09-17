@@ -23,6 +23,12 @@ pub enum KvsError {
     /// System clock error (current time is before the Unix epoch).
     #[error(transparent)]
     Clock(#[from] std::time::SystemTimeError),
+    /// Stored value is not valid UTF-8.
+    #[error(transparent)]
+    Utf8(#[from] std::string::FromUtf8Error),
+    /// A data file referenced by the index is missing.
+    #[error("Data file not found, id {0}")]
+    MissingDataFile(u64),
 }
 
 /// Result type for kvs.

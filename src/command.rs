@@ -56,6 +56,25 @@ impl TryFrom<u8> for CommandType {
 }
 
 impl<'a> Command<'a> {
+
+    #[inline]
+    pub fn body_len(header: &[u8; HEADER_LEN]) -> usize {
+        u32::from_le_bytes(
+            header[CRC_LEN..HEADER_LEN]
+                .try_into()
+                .expect("fixed-size slice"),
+        ) as usize
+    }
+
+    #[inline]
+    pub fn get_timestamp(&self) -> u64 {
+        match self {
+            Command::Set { ts, .. } => *ts,
+            Command::Rm { ts, .. } => *ts,
+        }
+    }
+
+    #[inline]
     pub fn get_key(&self) -> &[u8] {
         match self {
             Command::Set { key, .. } => key,
@@ -63,19 +82,11 @@ impl<'a> Command<'a> {
         }
     }
 
+    #[inline]
     pub fn get_value(&self) -> Option<&[u8]> {
         match self {
             Command::Set { value, .. } => Some(value),
             Command::Rm { .. } => None,
-        }
-    }
-
-    #[inline]
-    fn get_command_type(byte: &u8) -> Result<CommandType> {
-        match byte {
-            0 => Ok(CommandType::Set),
-            1 => Ok(CommandType::Rm),
-            _ => Err(KvsError::UnexpectedCommandType),
         }
     }
 
@@ -343,6 +354,51 @@ mod tests {
         match Command::deserialize(&bytes) {
             Err(KvsError::UnexpectedCommandType) => {}
             other => panic!("expected UnexpectedCommandType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn body_len_reads_little_endian_length_field() {
+        let mut header = [0u8; HEADER_LEN];
+        header[CRC_LEN..].copy_from_slice(&0x0102_0304u32.to_le_bytes());
+        assert_eq!(Command::body_len(&header), 0x0102_0304);
+    }
+
+    #[test]
+    fn body_len_ignores_crc_bytes() {
+        let mut header = [0u8; HEADER_LEN];
+        header[CRC_LEN..].copy_from_slice(&7u32.to_le_bytes());
+        assert_eq!(Command::body_len(&header), 7);
+
+        header[..CRC_LEN].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(Command::body_len(&header), 7);
+    }
+
+    #[test]
+    fn body_len_boundary_values() {
+        let mut header = [0u8; HEADER_LEN];
+        assert_eq!(Command::body_len(&header), 0);
+
+        header[CRC_LEN..].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(Command::body_len(&header), u32::MAX as usize);
+    }
+
+    #[test]
+    fn body_len_matches_serialized_record() {
+        for cmd in [
+            Command::Set {
+                ts: 42,
+                key: b"key1",
+                value: b"value1",
+            },
+            Command::Rm {
+                ts: 43,
+                key: b"key2",
+            },
+        ] {
+            let bytes = cmd.serialize();
+            let header: [u8; HEADER_LEN] = bytes[..HEADER_LEN].try_into().unwrap();
+            assert_eq!(Command::body_len(&header), bytes.len() - HEADER_LEN);
         }
     }
 

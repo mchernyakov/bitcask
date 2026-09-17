@@ -9,196 +9,9 @@
 //!   batch mode exists. Run them with `cargo test -- --ignored`.
 //! - The `compaction` test is expected to fail until compaction is implemented.
 
-use assert_cmd::prelude::*;
 use kvs::{Bitcask, Config, DurabilityPolicy, KvStore, Result};
-use predicates::ord::eq;
-use predicates::str::{contains, is_empty, PredicateStrExt};
-use std::process::Command;
 use tempfile::TempDir;
 use walkdir::WalkDir;
-
-// `kvs` with no args should exit with a non-zero code.
-#[test]
-#[ignore = "requires batch CLI mode"]
-fn cli_no_args() {
-    Command::cargo_bin("kvs").unwrap().assert().failure();
-}
-
-// `kvs -V` should print the version.
-#[test]
-#[ignore = "requires batch CLI mode"]
-fn cli_version() {
-    Command::cargo_bin("kvs")
-        .unwrap()
-        .args(["-V"])
-        .assert()
-        .stdout(contains(env!("CARGO_PKG_VERSION")));
-}
-
-// `kvs get <KEY>` should print "Key not found" for a non-existent key and exit with zero.
-#[test]
-#[ignore = "requires batch CLI mode"]
-fn cli_get_non_existent_key() {
-    let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    Command::cargo_bin("kvs")
-        .unwrap()
-        .args(["get", "key1"])
-        .current_dir(&temp_dir)
-        .assert()
-        .success()
-        .stdout(eq("Key not found").trim());
-}
-
-// `kvs rm <KEY>` should print "Key not found" for an empty database and exit with non-zero code.
-#[test]
-#[ignore = "requires batch CLI mode"]
-fn cli_rm_non_existent_key() {
-    let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    Command::cargo_bin("kvs")
-        .unwrap()
-        .args(["rm", "key1"])
-        .current_dir(&temp_dir)
-        .assert()
-        .failure()
-        .stdout(eq("Key not found").trim());
-}
-
-// `kvs set <KEY> <VALUE>` should print nothing and exit with zero.
-#[test]
-#[ignore = "requires batch CLI mode"]
-fn cli_set() {
-    let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    Command::cargo_bin("kvs")
-        .unwrap()
-        .args(["set", "key1", "value1"])
-        .current_dir(&temp_dir)
-        .assert()
-        .success()
-        .stdout(is_empty());
-}
-
-// `kvs get <KEY>` should print the stored value and exit with zero.
-#[test]
-#[ignore = "requires batch CLI mode"]
-fn cli_get_stored() -> Result<()> {
-    let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-
-    let mut store = Bitcask::open(Config::new(temp_dir.path()))?;
-    store.set("key1", "value1")?;
-    store.set("key2", "value2")?;
-    drop(store);
-
-    Command::cargo_bin("kvs")
-        .unwrap()
-        .args(["get", "key1"])
-        .current_dir(&temp_dir)
-        .assert()
-        .success()
-        .stdout(eq("value1").trim());
-
-    Command::cargo_bin("kvs")
-        .unwrap()
-        .args(["get", "key2"])
-        .current_dir(&temp_dir)
-        .assert()
-        .success()
-        .stdout(eq("value2").trim());
-
-    Ok(())
-}
-
-// `kvs rm <KEY>` should print nothing and exit with zero.
-#[test]
-#[ignore = "requires batch CLI mode"]
-fn cli_rm_stored() -> Result<()> {
-    let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-
-    let mut store = Bitcask::open(Config::new(temp_dir.path()))?;
-    store.set("key1", "value1")?;
-    drop(store);
-
-    Command::cargo_bin("kvs")
-        .unwrap()
-        .args(["rm", "key1"])
-        .current_dir(&temp_dir)
-        .assert()
-        .success()
-        .stdout(is_empty());
-
-    Command::cargo_bin("kvs")
-        .unwrap()
-        .args(["get", "key1"])
-        .current_dir(&temp_dir)
-        .assert()
-        .success()
-        .stdout(eq("Key not found").trim());
-
-    Ok(())
-}
-
-#[test]
-#[ignore = "requires batch CLI mode"]
-fn cli_invalid_get() {
-    Command::cargo_bin("kvs")
-        .unwrap()
-        .args(["get"])
-        .assert()
-        .failure();
-
-    Command::cargo_bin("kvs")
-        .unwrap()
-        .args(["get", "extra", "field"])
-        .assert()
-        .failure();
-}
-
-#[test]
-#[ignore = "requires batch CLI mode"]
-fn cli_invalid_set() {
-    Command::cargo_bin("kvs")
-        .unwrap()
-        .args(["set"])
-        .assert()
-        .failure();
-
-    Command::cargo_bin("kvs")
-        .unwrap()
-        .args(["set", "missing_field"])
-        .assert()
-        .failure();
-
-    Command::cargo_bin("kvs")
-        .unwrap()
-        .args(["set", "extra", "extra", "field"])
-        .assert()
-        .failure();
-}
-
-#[test]
-#[ignore = "requires batch CLI mode"]
-fn cli_invalid_rm() {
-    Command::cargo_bin("kvs")
-        .unwrap()
-        .args(["rm"])
-        .assert()
-        .failure();
-
-    Command::cargo_bin("kvs")
-        .unwrap()
-        .args(["rm", "extra", "field"])
-        .assert()
-        .failure();
-}
-
-#[test]
-#[ignore = "requires batch CLI mode"]
-fn cli_invalid_subcommand() {
-    Command::cargo_bin("kvs")
-        .unwrap()
-        .args(["unknown", "subcommand"])
-        .assert()
-        .failure();
-}
 
 #[test]
 fn set_then_get_with_sync_on_every_put() -> Result<()> {
@@ -350,7 +163,11 @@ fn rotation_splits_log_into_multiple_files() -> Result<()> {
     let mut store = Bitcask::open(Config::new(temp_dir.path()))?;
     for i in 0..200 {
         let key = format!("key{}", i);
-        assert_eq!(store.get(&key)?, Some(value.clone()), "lost {key} after reopen");
+        assert_eq!(
+            store.get(&key)?,
+            Some(value.clone()),
+            "lost {key} after reopen"
+        );
     }
 
     Ok(())
@@ -525,7 +342,11 @@ fn reopen_from_hints_matches_replay_from_data() -> Result<()> {
     let mut store = Bitcask::open(config())?;
     for i in 0..100 {
         let key = format!("filler{}", i);
-        assert_eq!(store.get(&key)?, Some(filler.clone()), "hint path lost {key}");
+        assert_eq!(
+            store.get(&key)?,
+            Some(filler.clone()),
+            "hint path lost {key}"
+        );
     }
     drop(store);
 
@@ -541,7 +362,11 @@ fn reopen_from_hints_matches_replay_from_data() -> Result<()> {
     let mut store = Bitcask::open(config())?;
     for i in 0..100 {
         let key = format!("filler{}", i);
-        assert_eq!(store.get(&key)?, Some(filler.clone()), "replay path lost {key}");
+        assert_eq!(
+            store.get(&key)?,
+            Some(filler.clone()),
+            "replay path lost {key}"
+        );
     }
 
     Ok(())

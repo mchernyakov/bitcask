@@ -52,12 +52,11 @@ impl Bitcask {
     }
 
     fn replay(&mut self) -> Result<()> {
-        for (file_id, reader_file) in self.readers.iter() {
-            let hint_file_path = self.dir.join(hint_file_name(*file_id));
-            if (*file_id != self.current_file_id) && fs::exists(&hint_file_path)? {
+        for (&file_id, reader_file) in &self.readers {
+            let hint_file_path = self.dir.join(hint_file_name(file_id));
+            if (file_id != self.current_file_id) && fs::exists(&hint_file_path)? {
                 let hint_file = OpenOptions::new().read(true).open(&hint_file_path)?;
                 let mut hint_reader = BufReader::new(hint_file);
-                hint_reader.seek(SeekFrom::Start(0))?;
                 let hint_file_len = hint_reader.get_ref().metadata()?.len();
 
                 let mut position = 0;
@@ -72,12 +71,7 @@ impl Bitcask {
                         Err(e) => return Err(e.into()),
                     }
 
-                    let body_len = header[4..8].try_into();
-
-                    let body_len = match body_len {
-                        Ok(bytes) => u32::from_le_bytes(bytes) as usize,
-                        Err(_) => return Err(KvsError::Corruption),
-                    };
+                    let body_len = Command::body_len(&header);
 
                     let remaining = hint_file_len - position - HEADER_LEN as u64;
                     if body_len as u64 > remaining {
@@ -101,7 +95,7 @@ impl Bitcask {
                         Err(e) => return Err(e.into()),
                     }
 
-                    match IndexValue::deserialize(&buf, *file_id) {
+                    match IndexValue::deserialize(&buf, file_id) {
                         Ok((key, value, _)) => {
                             self.in_mem_index.insert(key.to_vec(), value);
                         }
@@ -137,16 +131,11 @@ impl Bitcask {
                     Err(e) => return Err(e.into()),
                 }
 
-                let body_len = header[4..8].try_into();
-
-                let body_len = match body_len {
-                    Ok(bytes) => u32::from_le_bytes(bytes) as usize,
-                    Err(_) => return Err(KvsError::Corruption),
-                };
+                let body_len = Command::body_len(&header);
 
                 let remaining = file_len - start - HEADER_LEN as u64;
                 if body_len as u64 > remaining {
-                    return if *file_id == self.current_file_id {
+                    return if file_id == self.current_file_id {
                         self.writer.get_ref().set_len(start)?;
                         self.offset = start;
                         Ok(())
@@ -161,7 +150,7 @@ impl Bitcask {
                 match buf_reader.read_exact(&mut buf[HEADER_LEN..]) {
                     Ok(()) => {}
                     Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                        if *file_id == self.current_file_id {
+                        if file_id == self.current_file_id {
                             self.writer.get_ref().set_len(start)?;
                             self.offset = start;
                             return Ok(());
@@ -175,7 +164,7 @@ impl Bitcask {
                 let (deserialized, _) = Command::deserialize(&buf)?;
                 match deserialized {
                     Command::Set { ts, key, .. } => {
-                        let file_id_copy = *file_id;
+                        let file_id_copy = file_id;
                         self.in_mem_index.insert(
                             key.to_vec(),
                             IndexValue {
@@ -188,7 +177,7 @@ impl Bitcask {
                     }
                     Command::Rm { key, .. } => {
                         self.stale_bytes_count = self.stale_bytes_count + buf.len() as u64;
-                        self.in_mem_index.remove(&key.to_vec());
+                        self.in_mem_index.remove(key);
                     }
                 }
 
@@ -199,7 +188,7 @@ impl Bitcask {
         Ok(())
     }
 
-    fn need_to_flush(&mut self, file_id: u64) -> Result<()> {
+    fn ensure_flushed(&mut self, file_id: u64) -> Result<()> {
         if file_id == self.current_file_id {
             if self.flushed_offset < self.offset {
                 self.writer.flush()?;
@@ -228,14 +217,8 @@ impl Bitcask {
         Ok(())
     }
 
-    fn handle_file_rotation(&mut self, start_id: u64, forced: bool) -> Result<()> {
-        if !forced && self.offset < self.file_size_threshold {
-            return Ok(());
-        }
-
+    fn rotate_to(&mut self, next_file_id: u64) -> Result<()> {
         self.sync()?;
-
-        let next_file_id = start_id + 1;
 
         let next_file = self.dir.join(data_file_name(next_file_id));
 
@@ -257,10 +240,17 @@ impl Bitcask {
         Ok(())
     }
 
+    fn rotate_if_full(&mut self) -> Result<()> {
+        if self.offset < self.file_size_threshold {
+            return Ok(());
+        }
+        self.rotate_to(self.current_file_id + 1)
+    }
+
     fn post_write_ops(&mut self) -> Result<()> {
         self.compaction()?;
         self.handle_policy()?;
-        self.handle_file_rotation(self.current_file_id, false)?;
+        self.rotate_if_full()?;
         Ok(())
     }
 
@@ -336,12 +326,7 @@ impl Bitcask {
                     Err(e) => return Err(e.into()),
                 }
 
-                let body_len = header[4..8].try_into();
-
-                let body_len = match body_len {
-                    Ok(bytes) => u32::from_le_bytes(bytes) as usize,
-                    Err(_) => return Err(KvsError::Corruption),
-                };
+                let body_len = Command::body_len(&header);
 
                 let remaining = file_len - src_offset - HEADER_LEN as u64;
                 if body_len as u64 > remaining {
@@ -416,7 +401,7 @@ impl Bitcask {
         }
 
         // after compaction, re-open the writer to the new file
-        self.handle_file_rotation(compaction_file_id, true)?;
+        self.rotate_to(compaction_file_id + 1)?;
 
         for id in ids_to_remove {
             if let Some(file) = self.readers.remove(&id) {
@@ -434,6 +419,32 @@ impl Bitcask {
 
         self.stale_bytes_count = 0;
 
+        Ok(())
+    }
+
+    fn append(&mut self, command: &Command) -> Result<()> {
+        let serialized_command = command.serialize();
+        let offset = self.offset;
+
+        self.writer.write_all(&serialized_command)?;
+
+        let index_value = IndexValue {
+            file_id: self.current_file_id,
+            ts: command.get_timestamp(),
+            offset,
+            len: serialized_command.len(),
+        };
+
+        if let Some(old) = self
+            .in_mem_index
+            .insert(command.get_key().to_vec(), index_value)
+        {
+            self.stale_bytes_count += old.len as u64;
+        }
+
+        self.offset += serialized_command.len() as u64;
+
+        self.post_write_ops()?;
         Ok(())
     }
 }
@@ -502,8 +513,10 @@ impl KvStore for Bitcask {
             .append(true)
             .open(&current_path)?;
 
+        let current_file_id = max_id.unwrap_or(1);
+
         let r_file = OpenOptions::new().read(true).open(&current_path)?;
-        read_handlers.insert(max_id.unwrap_or(1), r_file);
+        read_handlers.insert(current_file_id, r_file);
 
         let writer = BufWriter::new(w_file);
 
@@ -511,7 +524,7 @@ impl KvStore for Bitcask {
 
         let mut bitcask = Bitcask {
             dir,
-            current_file_id: max_id.unwrap_or(1),
+            current_file_id,
             writer,
             readers: read_handlers,
             in_mem_index,
@@ -538,28 +551,8 @@ impl KvStore for Bitcask {
             key: key.as_bytes(),
             value: value.as_bytes(),
         };
-        let serialized_command = command.serialize();
-        let offset = self.offset;
 
-        self.writer.write_all(&serialized_command)?;
-
-        let index_value = IndexValue {
-            file_id: self.current_file_id,
-            ts,
-            offset,
-            len: serialized_command.len(),
-        };
-
-        if let Some(old) = self
-            .in_mem_index
-            .insert(key.as_bytes().to_vec(), index_value)
-        {
-            self.stale_bytes_count += old.len as u64;
-        }
-
-        self.offset = self.offset + serialized_command.len() as u64;
-
-        self.post_write_ops()?;
+        self.append(&command)?;
         Ok(())
     }
 
@@ -572,16 +565,7 @@ impl KvStore for Bitcask {
         let ts = unix_now()?.as_secs();
 
         let command = Command::Rm { ts, key: key_bytes };
-        let serialized_command = command.serialize();
-
-        self.writer.write_all(&serialized_command)?;
-
-        if let Some(index_value) = self.in_mem_index.remove(key_bytes) {
-            self.stale_bytes_count += index_value.len as u64;
-        }
-        self.offset = self.offset + serialized_command.len() as u64;
-
-        self.post_write_ops()?;
+        self.append(&command)?;
         Ok(())
     }
 
@@ -592,24 +576,20 @@ impl KvStore for Bitcask {
             None => return Ok(None),
         };
 
-        self.need_to_flush(file_id)?;
+        self.ensure_flushed(file_id)?;
 
         let mut buf = vec![0u8; record_len];
-        let reader = self.readers.get(&file_id).ok_or_else(|| {
-            let msg = format!("File not found, id {}", file_id);
-            KvsError::Io(io::Error::new(io::ErrorKind::NotFound, msg))
-        })?;
+        let reader = self
+            .readers
+            .get(&file_id)
+            .ok_or(KvsError::MissingDataFile(file_id))?;
 
         reader.read_exact_at(&mut buf, offset)?;
 
         let (deserialized, _) = Command::deserialize(&buf)?;
         let cmd = deserialized.get_value();
         match cmd {
-            Some(value) => {
-                let value_str = String::from_utf8(value.to_vec())
-                    .map_err(|e| KvsError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
-                Ok(Some(value_str))
-            }
+            Some(value) => Ok(Some(String::from_utf8(value.to_vec())?)),
             None => Ok(None),
         }
     }
