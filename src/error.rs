@@ -29,6 +29,8 @@ pub enum KvsError {
     /// A data file referenced by the index is missing.
     #[error("Data file not found, id {0}")]
     MissingDataFile(u64),
+    #[error("Lock poisoned")]
+    LockPoisoned,
 }
 
 /// Result type for kvs.

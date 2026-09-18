@@ -1,8 +1,8 @@
 use kvs::Bitcask;
 use kvs::Config;
 use kvs::KvStore;
-use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 use tracing_subscriber::EnvFilter;
 
 fn main() {
@@ -17,7 +17,7 @@ fn main() {
 
     print_help();
 
-    let mut kvstore = match Bitcask::open(Config::new("kvs/")) {
+    let kvstore = match Bitcask::open(Config::new("kvs/")) {
         Ok(store) => store,
         Err(err) => {
             eprintln!("Error opening KvStore (Bitcask): {}", err);
@@ -42,7 +42,7 @@ fn main() {
                         print_help();
                     }
                     _ => {
-                        execute_command(line, &mut kvstore);
+                        execute_command(line, &kvstore);
                     }
                 }
             }
@@ -66,7 +66,7 @@ fn main() {
     }
 }
 
-fn execute_command(input: &str, kvstore: &mut dyn KvStore) {
+fn execute_command(input: &str, kvstore: &impl KvStore) {
     let mut parts = input.split_whitespace();
 
     let command = match parts.next() {
@@ -135,7 +135,7 @@ fn print_help() {
     println!("  quit               Exit");
 }
 
-fn set(key: &str, value: &str, kvstore: &mut dyn KvStore) {
+fn set(key: &str, value: &str, kvstore: &impl KvStore) {
     let res = kvstore.set(key, value);
     if let Err(e) = res {
         eprintln!("Error: {}", e);
@@ -144,7 +144,7 @@ fn set(key: &str, value: &str, kvstore: &mut dyn KvStore) {
     }
 }
 
-fn get(key: &str, kvstore: &mut dyn KvStore) {
+fn get(key: &str, kvstore: &impl KvStore) {
     let res = kvstore.get(key);
     match res {
         Ok(Some(value)) => println!("{}", value),
@@ -153,7 +153,7 @@ fn get(key: &str, kvstore: &mut dyn KvStore) {
     }
 }
 
-fn rm(key: &str, kvstore: &mut dyn KvStore) {
+fn rm(key: &str, kvstore: &impl KvStore) {
     if let Err(err) = kvstore.remove(key) {
         eprintln!("Error: {}", err);
     } else {
