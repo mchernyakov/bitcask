@@ -39,6 +39,15 @@ struct Shared {
     lock_file: LockFile,
 }
 
+impl Drop for Shared {
+    fn drop(&mut self) {
+        let sw = self.writer_lock();
+        if let Ok(mut single_writer) = sw {
+            let _ = self.sync(&mut single_writer);
+        }
+    }
+}
+
 // fields what only the writer needs to access
 struct WriterState {
     current_file_id: u64,
@@ -50,6 +59,12 @@ struct WriterState {
 }
 
 impl Shared {
+    fn sync(&self, single_writer: &mut MutexGuard<WriterState>) -> Result<()> {
+        single_writer.file.sync_all()?;
+        single_writer.flushed_offset = single_writer.offset;
+        Ok(())
+    }
+
     fn writer_lock(&self) -> Result<MutexGuard<'_, WriterState>> {
         trace!("acquiring lock; struct {}, type {}", "writer", "WRITE");
         self.writer.lock().map_err(|_| KvsError::LockPoisoned)
@@ -184,32 +199,17 @@ impl Clone for Bitcask {
     }
 }
 
-impl Drop for Bitcask {
-    fn drop(&mut self) {
-        let sw = self.shared.writer_lock();
-        if let Ok(mut single_writer) = sw {
-            let _ = self.sync(&mut single_writer);
-        }
-    }
-}
-
 impl Bitcask {
-    fn sync(&self, single_writer: &mut MutexGuard<WriterState>) -> Result<()> {
-        single_writer.file.sync_all()?;
-        single_writer.flushed_offset = single_writer.offset;
-        Ok(())
-    }
-
     fn handle_policy(&self, single_writer: &mut MutexGuard<WriterState>) -> Result<()> {
         match self.shared.config.durability_policy {
             DurabilityPolicy::SyncOnEveryPut => {
-                self.sync(single_writer)?;
+                self.shared.sync(single_writer)?;
             }
             DurabilityPolicy::SyncOnInterval => {
                 let now = unix_now()?.as_millis() as u64;
                 if now - single_writer.last_ts_flushed >= self.shared.config.flush_threshold_millis
                 {
-                    self.sync(single_writer)?;
+                    self.shared.sync(single_writer)?;
                     single_writer.last_ts_flushed = now;
                 }
             }
@@ -226,7 +226,7 @@ impl Bitcask {
         readers: &mut BTreeMap<u64, Arc<File>>,
         next_file_id: u64,
     ) -> Result<()> {
-        self.sync(single_writer)?;
+        self.shared.sync(single_writer)?;
 
         let next_file = self.shared.config.dir.join(data_file_name(next_file_id));
 
@@ -627,24 +627,27 @@ impl KvStore for Bitcask {
 
     fn get(&self, key: &str) -> Result<Option<String>> {
         let key_bytes = key.as_bytes();
-        // TODO do the retry loop
-        let readers = self.shared.readers_read()?;
-        let Some(entry) = self.shared.index_read()?.get(key_bytes).copied() else {
-            return Ok(None);
-        };
 
-        let file = readers
-            .get(&entry.file_id)
-            .cloned()
-            .ok_or(KvsError::MissingDataFile(entry.file_id))?;
-        let mut buf = vec![0u8; entry.len];
-        file.read_exact_at(&mut buf, entry.offset)?;
+        loop {
+            let Some(entry) = self.shared.index_read()?.get(key_bytes).copied() else {
+                return Ok(None);
+            };
 
-        let (deserialized, _) = Command::deserialize(&buf)?;
-        let cmd = deserialized.get_value();
-        match cmd {
-            Some(value) => Ok(Some(String::from_utf8(value.to_vec())?)),
-            None => Ok(None),
+            // a merge could delete this file when we acquired the index lock,
+            // we want to retry until both data structures are in sync
+            let Some(file) = self.shared.readers_read()?.get(&entry.file_id).cloned() else {
+                continue;
+            };
+
+            let mut buf = vec![0u8; entry.len];
+            file.read_exact_at(&mut buf, entry.offset)?;
+
+            let (deserialized, _) = Command::deserialize(&buf)?;
+            let cmd = deserialized.get_value();
+            return match cmd {
+                Some(value) => Ok(Some(String::from_utf8(value.to_vec())?)),
+                None => Ok(None),
+            };
         }
     }
 }

@@ -8,8 +8,10 @@ follows the [PingCAP Talent Plan](https://github.com/pingcap/talent-plan)
 **Status: WIP.** The log rotates across multiple data files
 (`000001.data`, …) with an append-only active file and immutable sealed
 files, stale data is reclaimed by a crash-safe compaction, and hint files
-make startup fast; concurrency (one writer, many readers) is next —
-see [ROADMAP.md](ROADMAP.md).
+make startup fast. The store is now concurrent (one writer at a time, many
+readers, cheaply clonable handles, a lock file guarding the directory);
+moving the merge to a background thread is next — see
+[ROADMAP.md](ROADMAP.md) and [PHASE5.md](PHASE5.md).
 
 ## How it works
 
@@ -40,8 +42,13 @@ The CRC-32 covers everything after itself. Torn writes at the tail of the log
 are detected and truncated on startup; corruption elsewhere fails `open`
 loudly rather than serving damaged data.
 
-Writes go through a buffered append-only handle, reads through a separate
-read-only handle, with an explicit durability policy chosen at `open`:
+The store handle is a cheap clone (`Arc` underneath): every thread gets its
+own, methods take `&self`. Writes go through a single mutex-guarded
+append-only handle — the OS page cache makes each record visible to readers
+the moment it's written; reads `pread` shared per-file handles, holding no
+lock during I/O, and retry if a merge moves a record mid-read. A `flock`ed
+`bitcask.lock` file makes sure only one process owns the directory.
+Durability is an explicit policy chosen at `open`:
 
 - `SyncOnEveryPut` — fsync after every write (durable, slow)
 - `SyncOnInterval` — fsync at most once per interval
@@ -56,10 +63,10 @@ override individual fields with struct-update syntax:
 use kvs::{Bitcask, Config, DurabilityPolicy, KvStore};
 
 // defaults: OsDecides, 1 MB files, 1 MB compaction threshold, 1 s flush interval
-let mut store = Bitcask::open(Config::new("./data"))?;
+let store = Bitcask::open(Config::new("./data"))?;
 
 // or tune it:
-let mut store = Bitcask::open(Config {
+let store = Bitcask::open(Config {
     durability_policy: DurabilityPolicy::SyncOnInterval,
     file_size_threshold: 4 << 20,
     ..Config::new("./data")
@@ -68,6 +75,10 @@ let mut store = Bitcask::open(Config {
 store.set("key", "value")?;
 assert_eq!(store.get("key")?, Some("value".to_owned()));
 store.remove("key")?;
+
+// handles are cheap clones sharing one store — hand them to threads
+let handle = store.clone();
+std::thread::spawn(move || handle.get("key"));
 ```
 
 Config fields:
@@ -88,4 +99,8 @@ Corruption handling is tested bit-by-bit: every single-bit flip in a record
 directory must shrink under overwrite load, and every value must survive a
 reopen from a compacted, multi-file state. Hint files are proven to be both
 used (startup resolves keys through them) and disposable (corrupt, torn, or
-orphaned hints fall back to data replay).
+orphaned hints fall back to data replay). Concurrency is stress-tested:
+reader threads hammer `get` under constant merges and assert per-key
+generations never go backwards (`STRESS_WRITES=…` for a longer soak),
+concurrent writers must not lose a write, and the lock file must refuse a
+second `open` until the last handle drops.
