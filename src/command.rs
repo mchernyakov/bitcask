@@ -56,7 +56,6 @@ impl TryFrom<u8> for CommandType {
 }
 
 impl<'a> Command<'a> {
-
     #[inline]
     pub fn body_len(header: &[u8; HEADER_LEN]) -> usize {
         u32::from_le_bytes(

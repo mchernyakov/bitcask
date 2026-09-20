@@ -60,10 +60,13 @@ Groundwork that makes rotation and compaction much easier later.
 
 Bitcask's model: exactly one writer, many readers.
 
-- [ ] Immutable old files + per-reader handles + `read_exact_at` (no shared
-  cursor) make readers naturally lock-free except for the keydir.
-- [ ] Start with `RwLock<HashMap>`; explore lock-free maps afterwards.
+- [x] Immutable old files + shared `Arc<File>` handles + `read_exact_at` (no
+  shared cursor) make readers naturally lock-free except for the keydir
+  (pread made per-reader handles unnecessary).
+- [x] Start with `RwLock<HashMap>` — done, plus a lock file and a
+  concurrent stress test.
 - [ ] Move merge to a background thread.
+- [ ] Explore lock-free maps for the keydir (DashMap / evmap) afterwards.
 
 ## Phase 6 — Measure
 

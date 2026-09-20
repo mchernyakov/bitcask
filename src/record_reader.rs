@@ -1,5 +1,5 @@
-use crate::command::{Command, HEADER_LEN};
 use crate::Result;
+use crate::command::{Command, HEADER_LEN};
 use std::io;
 use std::io::Read;
 use tracing::debug;

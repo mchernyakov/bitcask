@@ -31,6 +31,9 @@ pub enum KvsError {
     MissingDataFile(u64),
     #[error("Lock poisoned")]
     LockPoisoned,
+    /// Another process (or a live handle in this one) owns the store directory.
+    #[error("Store is locked by another process")]
+    StoreLocked,
 }
 
 /// Result type for kvs.

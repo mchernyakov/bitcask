@@ -96,7 +96,10 @@ mod tests {
             BytesUtil::read_u64(&buf, &mut cursor).unwrap(),
             0x1122_3344_5566_7788
         );
-        assert_eq!(BytesUtil::read_bytes(&buf, &mut cursor, 4).unwrap(), b"tail");
+        assert_eq!(
+            BytesUtil::read_bytes(&buf, &mut cursor, 4).unwrap(),
+            b"tail"
+        );
         assert_eq!(cursor, buf.len());
     }
 

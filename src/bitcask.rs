@@ -2,6 +2,7 @@ use crate::command::Command;
 use crate::config::Config;
 use crate::index_value::IndexValue;
 use crate::kvstore::KvStore;
+use crate::lock_file::LockFile;
 use crate::policy::DurabilityPolicy;
 use crate::record_reader::{RecordRead, RecordReader};
 use crate::{KvsError, Result};
@@ -15,6 +16,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const LOCK_FILE_NAME: &str = "bitcask.lock";
 
 fn unix_now() -> Result<Duration> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?)
@@ -33,6 +36,7 @@ struct Shared {
     next_file_id: AtomicU64,
     merging: AtomicBool,
     config: Config,
+    lock_file: LockFile,
 }
 
 // fields what only the writer needs to access
@@ -498,11 +502,12 @@ impl MergeOutput {
 
 impl KvStore for Bitcask {
     fn open(config: Config) -> Result<Self> {
-        // TODO the lock file
-
         let dir_path: &Path = config.dir.as_path();
 
         fs::create_dir_all(dir_path)?;
+
+        let lock_file_path = dir_path.join(LOCK_FILE_NAME);
+        let lock_file = LockFile::acquire(lock_file_path)?;
 
         let mut read_handlers: BTreeMap<u64, Arc<File>> = BTreeMap::new();
         let mut max_id: Option<u64> = None;
@@ -587,6 +592,7 @@ impl KvStore for Bitcask {
             writer: Mutex::new(loader.writer),
             next_file_id: AtomicU64::new(current_file_id + 1),
             merging: AtomicBool::new(false),
+            lock_file,
         };
 
         Ok(Bitcask {
