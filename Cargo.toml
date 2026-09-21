@@ -17,3 +17,8 @@ log = "0.4.34"
 tempfile = "3.0.7"
 walkdir = "2.2.7"
 test-log = { version = "0.2", features = ["trace"] }
+criterion = "0.8.2"
+
+[[bench]]
+name = "bitcask"
+harness = false

@@ -72,9 +72,15 @@ Bitcask's model: exactly one writer, many readers.
 
 ## Phase 6 — Measure
 
-- [ ] Criterion benchmarks: sync policies, buffered vs. unbuffered writes,
-  startup with vs. without hint files.
-- [ ] Turns the buffering trade-offs into visible numbers.
+- [x] Criterion benchmarks (`cargo bench`, `benches/bitcask.rs`): sync
+  policies, get, startup with vs. without hint files. (Buffered vs.
+  unbuffered writes became moot: the write-path `BufWriter` was removed in
+  Phase 5 for visibility reasons.) First numbers: set ~1.6 µs (OsDecides and
+  SyncOnInterval are indistinguishable), ~4 ms with fsync-per-put, get
+  ~0.6 µs. Hints show no win at 32-byte values — hint and data records are
+  nearly the same size; re-measure with large values.
+- [ ] Grow the benchmarks as questions come up (value-size sweep for hints,
+  merge throughput, allocation-sensitive paths like `RecordReader`).
 
 ## Future optimizations (backlog)
 

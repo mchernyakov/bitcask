@@ -56,4 +56,4 @@ There's also a small interactive REPL: `cargo run --bin kvs`.
 
 ## Tests
 
-`cargo test`.
+`cargo test`. Benchmarks: `cargo bench` (criterion, see `benches/bitcask.rs`).
