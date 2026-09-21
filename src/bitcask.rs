@@ -8,14 +8,15 @@ use crate::record_reader::{RecordRead, RecordReader};
 use crate::{KvsError, Result};
 use log::{debug, trace};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, Weak};
+use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{fs, thread};
 
 const LOCK_FILE_NAME: &str = "bitcask.lock";
 
@@ -24,7 +25,27 @@ fn unix_now() -> Result<Duration> {
 }
 
 pub struct Bitcask {
+    handle: Arc<Handle>,
+}
+
+struct Handle {
     shared: Arc<Shared>,
+    // compaction thread
+    compaction_tx: Option<SyncSender<()>>,
+    compaction_thread_handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        drop(self.compaction_tx.take());
+        if let Some(handle) = self.compaction_thread_handle.take() {
+            let _ = handle.join();
+        }
+
+        if let Ok(mut single_writer) = self.shared.writer_lock() {
+            let _ = self.shared.sync(&mut single_writer);
+        }
+    }
 }
 
 // !!! lock order rule: writer → readers → index !!!
@@ -33,19 +54,8 @@ struct Shared {
     readers: RwLock<BTreeMap<u64, Arc<File>>>,
     // the single writer
     writer: Mutex<WriterState>,
-    next_file_id: AtomicU64,
-    merging: AtomicBool,
     config: Config,
     lock_file: LockFile,
-}
-
-impl Drop for Shared {
-    fn drop(&mut self) {
-        let sw = self.writer_lock();
-        if let Ok(mut single_writer) = sw {
-            let _ = self.sync(&mut single_writer);
-        }
-    }
 }
 
 // fields what only the writer needs to access
@@ -88,6 +98,245 @@ impl Shared {
     fn index_write(&self) -> Result<std::sync::RwLockWriteGuard<'_, HashMap<Vec<u8>, IndexValue>>> {
         trace!("acquiring lock; struct {}, type {}", "index", "WRITE");
         self.index.write().map_err(|_| KvsError::LockPoisoned)
+    }
+
+    fn rotate_to(
+        &self,
+        single_writer: &mut MutexGuard<WriterState>,
+        readers: &mut BTreeMap<u64, Arc<File>>,
+        next_file_id: u64,
+    ) -> Result<()> {
+        self.sync(single_writer)?;
+
+        let next_file = self.config.dir.join(data_file_name(next_file_id));
+
+        let next_file_writer = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&next_file)?;
+
+        single_writer.file = next_file_writer;
+        single_writer.current_file_id = next_file_id;
+        single_writer.flushed_offset = 0;
+        single_writer.offset = 0;
+        single_writer.last_ts_flushed = unix_now()?.as_millis() as u64;
+
+        let next_file_reader = OpenOptions::new().read(true).open(&next_file)?;
+        let reader = Arc::new(next_file_reader);
+        readers.insert(next_file_id, reader);
+        Ok(())
+    }
+
+    fn rotate_if_full(&self, single_writer: &mut MutexGuard<WriterState>) -> Result<()> {
+        if single_writer.offset < self.config.file_size_threshold {
+            return Ok(());
+        }
+        let mut readers = self.readers_write()?;
+        self.rotate_to(
+            single_writer,
+            &mut readers,
+            single_writer.current_file_id + 1,
+        )?;
+        Ok(())
+    }
+
+    fn run_compaction(&self) -> Result<()> {
+        // 0) take a snapshot of the readers, stale bytes and next active file id
+        let (readers_snapshot, init_stale_bytes, first_compacted_file_id) = {
+            let mut writer = self.writer_lock()?;
+            if writer.stale_bytes_count < self.config.compaction_threshold {
+                return Ok(());
+            }
+
+            debug!(
+                "compaction triggered, stale bytes: {}",
+                writer.stale_bytes_count
+            );
+
+            let mut readers = self.readers_write()?;
+            let mut snapshot: Vec<(u64, Arc<File>)> = Vec::new();
+            for (&id, file) in &mut readers.iter() {
+                if id == writer.current_file_id {
+                    continue;
+                }
+                snapshot.push((id, Arc::clone(file)));
+            }
+            if snapshot.is_empty() {
+                return Ok(());
+            }
+
+            let stale = writer.stale_bytes_count;
+            let total_bytes: u64 = snapshot
+                .iter()
+                .map(|(_, f)| f.metadata().map(|m| m.len()).unwrap_or(0))
+                .sum();
+            let reserve = total_bytes / self.config.file_size_threshold + 2;
+
+            let next_active = writer.current_file_id + reserve + 1;
+            let prev_file_id = writer.current_file_id;
+            self.rotate_to(&mut writer, &mut readers, next_active)?;
+            (snapshot, stale, prev_file_id)
+        };
+
+        // 1) walk the snapshot of sealed files, hold no locks during the I/O
+        // 2) on entry: if SET -> check index (get(...)): if that points at the exact file and offset ->
+        //    append to the compaction file and save the index update in a pending list
+        //    (update them later, to avoid locking); otherwise -> do nothing,
+        //    the index is already updated (possible in next file)
+        // 3) compaction files get ids from the reserved range below the active
+        //    file (<id>.data.compact); when one is full -> finish it: sync,
+        //    rename to .data, add a read handle, then apply the pending updates,
+        //    checking each entry again and skipping keys that were overwritten
+        //    during the merge (their copies become garbage for a future merge)
+        // 4) finish the last, half-filled output the same way
+        // 5) remove the old files last: after a crash we see either leftover
+        //    .compact files (open() -> deletes them) or renamed outputs; their ids
+        //    are below the active file, so newer writes still win on replay
+        // 6) subtract the stale bytes counted at merge start — don't reset to
+        //    zero, writes during the merge added new garbage
+        let mut new_files: HashSet<u64> = HashSet::new();
+        let mut ids_to_remove: Vec<u64> = Vec::new();
+
+        let mut output: Option<MergeOutput> = None;
+        let mut next_compaction_file_id = first_compacted_file_id;
+
+        let mut pending_records: Vec<PendingUpdate> = Vec::new();
+
+        for (file_id, reader_file) in readers_snapshot.iter() {
+            debug!("compaction: processing file {}", file_id);
+
+            let out = match &mut output {
+                Some(out) => out,
+                slot @ None => {
+                    next_compaction_file_id += 1;
+                    slot.insert(MergeOutput::open(
+                        &self.config.dir,
+                        next_compaction_file_id,
+                    )?)
+                }
+            };
+
+            let mut buf_reader = BufReader::new(reader_file.as_ref());
+            buf_reader.seek(SeekFrom::Start(0))?;
+
+            let file_len = reader_file.metadata()?.len();
+
+            let mut data_file_record_reader = RecordReader::new(buf_reader, file_len);
+
+            loop {
+                match data_file_record_reader.next_record()? {
+                    RecordRead::Record { position, bytes } => {
+                        let (cmd_deserialized, _) = Command::deserialize(&bytes)?;
+                        match cmd_deserialized {
+                            Command::Set { ts, key, .. } => {
+                                // if the key is in the index, append to the compaction file
+                                let sits_in_index = self
+                                    .index_read()?
+                                    .get(key)
+                                    .is_some_and(|e| e.file_id == *file_id && e.offset == position);
+
+                                if sits_in_index {
+                                    let new_index_value = out.append(&bytes, key, ts)?;
+
+                                    let prev_index_value = IndexValue {
+                                        file_id: *file_id,
+                                        ts,
+                                        offset: position,
+                                        len: bytes.len(),
+                                    };
+
+                                    let pending_update = PendingUpdate {
+                                        key: key.to_vec(),
+                                        previous_value: prev_index_value,
+                                        new: new_index_value,
+                                    };
+
+                                    pending_records.push(pending_update);
+                                    debug!(
+                                        "compaction: key {} appended to file {}",
+                                        String::from_utf8_lossy(key),
+                                        file_id
+                                    );
+                                }
+                            }
+                            Command::Rm { .. } => {
+                                // do nothing, the index is already updated
+                            }
+                        }
+                    }
+                    RecordRead::CleanEof => {
+                        // remove the file from the reader's list
+                        // we finished processing it
+                        ids_to_remove.push(*file_id);
+                        break;
+                    }
+                    RecordRead::TornTail { .. } => {
+                        return Err(KvsError::Corruption);
+                    }
+                }
+            }
+
+            new_files.insert(out.id);
+
+            if out.is_full(self.config.file_size_threshold) {
+                self.finish_output(
+                    output
+                        .take()
+                        .expect("MergeOutput in compaction should be Some"),
+                    &mut pending_records,
+                )?;
+
+                output = None;
+            }
+        }
+
+        if let Some(out) = output.take() {
+            self.finish_output(out, &mut pending_records)?;
+        }
+
+        for id in ids_to_remove {
+            if let Some(file) = self.readers_write()?.remove(&id) {
+                drop(file);
+                let path_to_remove = self.config.dir.join(data_file_name(id));
+                fs::remove_file(path_to_remove)?;
+
+                // remove associated hint file
+                let hint_path = self.config.dir.join(hint_file_name(id));
+                if hint_path.exists() {
+                    fs::remove_file(hint_path)?;
+                }
+            }
+        }
+
+        self.writer_lock()?.stale_bytes_count -= init_stale_bytes;
+
+        Ok(())
+    }
+
+    fn finish_output(&self, mut out: MergeOutput, pending: &mut Vec<PendingUpdate>) -> Result<()> {
+        out.sync()?;
+        let path = self.config.dir.join(data_file_name_compaction(out.id));
+        let new_path = self.config.dir.join(data_file_name(out.id));
+        fs::rename(&path, &new_path)?;
+
+        let compacted_file = OpenOptions::new().read(true).open(&new_path)?;
+        self.readers_write()?
+            .insert(out.id, Arc::new(compacted_file));
+
+        let mut index_write = self.index_write()?;
+        for pending_update in pending.drain(..) {
+            let key = pending_update.key;
+            let prev_value = pending_update.previous_value;
+            let new_value = pending_update.new;
+            let still_prev = index_write
+                .get(&key)
+                .is_some_and(|e| e.file_id == prev_value.file_id && e.offset == prev_value.offset);
+
+            if still_prev {
+                index_write.insert(key, new_value);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -194,22 +443,23 @@ impl Loader {
 impl Clone for Bitcask {
     fn clone(&self) -> Self {
         Bitcask {
-            shared: Arc::clone(&self.shared),
+            handle: Arc::clone(&self.handle),
         }
     }
 }
 
 impl Bitcask {
     fn handle_policy(&self, single_writer: &mut MutexGuard<WriterState>) -> Result<()> {
-        match self.shared.config.durability_policy {
+        match self.handle.shared.config.durability_policy {
             DurabilityPolicy::SyncOnEveryPut => {
-                self.shared.sync(single_writer)?;
+                self.handle.shared.sync(single_writer)?;
             }
             DurabilityPolicy::SyncOnInterval => {
                 let now = unix_now()?.as_millis() as u64;
-                if now - single_writer.last_ts_flushed >= self.shared.config.flush_threshold_millis
+                if now - single_writer.last_ts_flushed
+                    >= self.handle.shared.config.flush_threshold_millis
                 {
-                    self.shared.sync(single_writer)?;
+                    self.handle.shared.sync(single_writer)?;
                     single_writer.last_ts_flushed = now;
                 }
             }
@@ -220,198 +470,26 @@ impl Bitcask {
         Ok(())
     }
 
-    fn rotate_to(
-        &self,
-        single_writer: &mut MutexGuard<WriterState>,
-        readers: &mut BTreeMap<u64, Arc<File>>,
-        next_file_id: u64,
-    ) -> Result<()> {
-        self.shared.sync(single_writer)?;
-
-        let next_file = self.shared.config.dir.join(data_file_name(next_file_id));
-
-        let next_file_writer = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&next_file)?;
-
-        single_writer.file = next_file_writer;
-        single_writer.current_file_id = next_file_id;
-        single_writer.flushed_offset = 0;
-        single_writer.offset = 0;
-        single_writer.last_ts_flushed = unix_now()?.as_millis() as u64;
-
-        let next_file_reader = OpenOptions::new().read(true).open(&next_file)?;
-        let reader = Arc::new(next_file_reader);
-        readers.insert(next_file_id, reader);
-        Ok(())
-    }
-
-    fn rotate_if_full(&self, single_writer: &mut MutexGuard<WriterState>) -> Result<()> {
-        if single_writer.offset < self.shared.config.file_size_threshold {
-            return Ok(());
-        }
-        let mut readers = self.shared.readers_write()?;
-        self.rotate_to(
-            single_writer,
-            &mut readers,
-            single_writer.current_file_id + 1,
-        )?;
-        Ok(())
-    }
-
     fn post_write_ops(&self, single_writer: &mut MutexGuard<WriterState>) -> Result<()> {
-        self.compaction(single_writer)?;
+        self.compaction_trigger(single_writer)?;
         self.handle_policy(single_writer)?;
-        self.rotate_if_full(single_writer)?;
+        self.handle.shared.rotate_if_full(single_writer)?;
         Ok(())
     }
 
-    fn compaction(&self, single_writer: &mut MutexGuard<WriterState>) -> Result<()> {
-        // skip if there is just 1 file
-        // or if there are no stale bytes
-        // TODO fix the holding the readers lock
-        let mut readers_access = self.shared.readers_write()?;
-        if readers_access.len() == 1
-            || single_writer.stale_bytes_count < self.shared.config.compaction_threshold
-        {
-            return Ok(());
-        }
-
-        debug!(
-            "compaction triggered, stale bytes: {}",
-            single_writer.stale_bytes_count
-        );
-
-        // 1) walk on every sealed file, skip the active one
-        // 2) parse entry: if it's SET -> check whether it's still in the index
-        // 3) if it's in the index -> append to the compaction file, update the index
-        // 4) compaction files get ids above the active file (<id>.data.compact);
-        //    if one is full -> sync it and open the next one
-        // 5) when all files are processed -> rename every .data.compact to .data
-        // 6) rotate the writer to an id above the compacted files, so new writes win on replay
-        // 7) remove the old files last: after a crash we either see leftover .compact
-        //    files (open() deletes them) or renamed files that win over the old ones
-        let mut new_files: HashSet<u64> = HashSet::new();
-        let mut ids_to_remove: Vec<u64> = Vec::new();
-
-        let mut output: Option<MergeOutput> = None;
-        let mut next_compaction_file_id = single_writer.current_file_id;
-
-        for (&file_id, reader_file) in readers_access.iter() {
-            if file_id == single_writer.current_file_id {
-                continue;
-            }
-
-            debug!("compaction: processing file {}", file_id);
-
-            let out = match &mut output {
-                Some(out) => out,
-                slot @ None => {
-                    next_compaction_file_id += 1;
-                    slot.insert(MergeOutput::open(
-                        &self.shared.config.dir,
-                        next_compaction_file_id,
-                    )?)
-                }
-            };
-
-            let mut buf_reader = BufReader::new(reader_file.as_ref());
-            buf_reader.seek(SeekFrom::Start(0))?;
-
-            let file_len = reader_file.metadata()?.len();
-
-            let mut data_file_record_reader = RecordReader::new(buf_reader, file_len);
-
-            let mut index_access_w = self.shared.index_write()?;
-
-            loop {
-                match data_file_record_reader.next_record()? {
-                    RecordRead::Record { position, bytes } => {
-                        let (deserialized, _) = Command::deserialize(&bytes)?;
-                        match deserialized {
-                            Command::Set { ts, key, .. } => {
-                                match index_access_w.get(key) {
-                                    // if the key sits in the index, append to the compaction file
-                                    Some(index_value)
-                                        if index_value.file_id == file_id
-                                            && index_value.offset == position =>
-                                    {
-                                        let new_index_value = out.append(&bytes, key, ts)?;
-                                        index_access_w.insert(key.to_vec(), new_index_value);
-                                        debug!(
-                                            "compaction: key {} appended to file {}",
-                                            String::from_utf8_lossy(key),
-                                            file_id
-                                        );
-                                    }
-                                    // key was removed or already re-written elsewhere, do nothing
-                                    _ => {}
-                                }
-                            }
-                            Command::Rm { .. } => {
-                                // do nothing, the index is already updated
-                            }
-                        }
-                    }
-                    RecordRead::CleanEof => {
-                        // remove the file from the reader's list
-                        // we finished processing it
-                        ids_to_remove.push(file_id);
-                        break;
-                    }
-                    RecordRead::TornTail { .. } => {
-                        return Err(KvsError::Corruption);
-                    }
-                }
-            }
-
-            out.sync()?;
-            new_files.insert(out.id);
-
-            if out.is_full(self.shared.config.file_size_threshold) {
-                output = None;
+    fn compaction_trigger(&self, single_writer: &mut MutexGuard<WriterState>) -> Result<()> {
+        if single_writer.stale_bytes_count >= self.handle.shared.config.compaction_threshold {
+            // signal to the compaction thread
+            if let Some(tx) = &self.handle.compaction_tx {
+                let _ = tx.try_send(());
             }
         }
-
-        for id in new_files {
-            let path = self.shared.config.dir.join(data_file_name_compaction(id));
-            let new_path = self.shared.config.dir.join(data_file_name(id));
-            fs::rename(&path, &new_path)?;
-            let compacted_file = OpenOptions::new().read(true).open(&new_path)?;
-            readers_access.insert(id, Arc::new(compacted_file));
-        }
-
-        // after compaction, rotate the writer above the merge outputs
-        // so new writes win on replay
-        self.rotate_to(
-            single_writer,
-            &mut readers_access,
-            next_compaction_file_id + 1,
-        )?;
-
-        for id in ids_to_remove {
-            if let Some(file) = readers_access.remove(&id) {
-                drop(file);
-                let path_to_remove = self.shared.config.dir.join(data_file_name(id));
-                fs::remove_file(path_to_remove)?;
-
-                // remove associated hint file
-                let hint_path = self.shared.config.dir.join(hint_file_name(id));
-                if hint_path.exists() {
-                    fs::remove_file(hint_path)?;
-                }
-            }
-        }
-
-        single_writer.stale_bytes_count = 0;
-
         Ok(())
     }
 
     fn append(&self, command: &Command) -> Result<()> {
         let serialized_command = command.serialize();
-        let mut single_writer = self.shared.writer_lock()?;
+        let mut single_writer = self.handle.shared.writer_lock()?;
         let offset = single_writer.offset;
 
         single_writer.file.write_all(&serialized_command)?;
@@ -429,13 +507,13 @@ impl Bitcask {
                     len: serialized_command.len(),
                 };
 
-                let mut index_writer = self.shared.index_write()?;
+                let mut index_writer = self.handle.shared.index_write()?;
                 if let Some(old) = index_writer.insert(command.get_key().to_vec(), index_value) {
                     single_writer.stale_bytes_count += old.len as u64;
                 }
             }
             Command::Rm { ts: _, key } => {
-                let mut index_writer = self.shared.index_write()?;
+                let mut index_writer = self.handle.shared.index_write()?;
                 if let Some(old) = index_writer.remove(*key) {
                     single_writer.stale_bytes_count += old.len as u64;
                 }
@@ -447,6 +525,12 @@ impl Bitcask {
         self.post_write_ops(&mut single_writer)?;
         Ok(())
     }
+}
+
+struct PendingUpdate {
+    key: Vec<u8>,
+    previous_value: IndexValue,
+    new: IndexValue,
 }
 
 struct MergeOutput {
@@ -583,21 +667,38 @@ impl KvStore for Bitcask {
             writer: writer_state,
         };
 
+        // replay the log
         loader.replay(&config)?;
 
-        let shared = Shared {
+        let (tx, rx) = sync_channel::<()>(1);
+
+        let shared = Arc::new(Shared {
             config,
             index: RwLock::new(loader.index),
             readers: RwLock::new(loader.readers),
             writer: Mutex::new(loader.writer),
-            next_file_id: AtomicU64::new(current_file_id + 1),
-            merging: AtomicBool::new(false),
             lock_file,
-        };
+        });
 
-        Ok(Bitcask {
-            shared: Arc::new(shared),
-        })
+        let weak = Arc::downgrade(&shared);
+
+        // compaction thread
+        let handle = thread::spawn(move || {
+            while rx.recv().is_ok() {
+                let Some(shared) = weak.upgrade() else { break };
+                if let Err(e) = shared.run_compaction() {
+                    debug!("compaction failed, will retry on next signal: {e}");
+                }
+            }
+        });
+
+        let internal = Arc::new(Handle {
+            shared,
+            compaction_tx: Some(tx),
+            compaction_thread_handle: Some(handle),
+        });
+
+        Ok(Bitcask { handle: internal })
     }
 
     fn set(&self, key: &str, value: &str) -> Result<()> {
@@ -614,7 +715,7 @@ impl KvStore for Bitcask {
 
     fn remove(&self, key: &str) -> Result<()> {
         let key_bytes = key.as_bytes();
-        if !self.shared.index_read()?.contains_key(key_bytes) {
+        if !self.handle.shared.index_read()?.contains_key(key_bytes) {
             return Err(KvsError::KeyNotFound);
         }
 
@@ -629,13 +730,19 @@ impl KvStore for Bitcask {
         let key_bytes = key.as_bytes();
 
         loop {
-            let Some(entry) = self.shared.index_read()?.get(key_bytes).copied() else {
+            let Some(entry) = self.handle.shared.index_read()?.get(key_bytes).copied() else {
                 return Ok(None);
             };
 
             // a merge could delete this file when we acquired the index lock,
             // we want to retry until both data structures are in sync
-            let Some(file) = self.shared.readers_read()?.get(&entry.file_id).cloned() else {
+            let Some(file) = self
+                .handle
+                .shared
+                .readers_read()?
+                .get(&entry.file_id)
+                .cloned()
+            else {
                 continue;
             };
 

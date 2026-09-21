@@ -65,7 +65,9 @@ Bitcask's model: exactly one writer, many readers.
   (pread made per-reader handles unnecessary).
 - [x] Start with `RwLock<HashMap>` — done, plus a lock file and a
   concurrent stress test.
-- [ ] Move merge to a background thread.
+- [x] Move merge to a background thread — writes no longer pay for
+  compaction (6.6× write throughput in the stress test); see
+  [PHASE5.md](PHASE5.md) for the design and measurements.
 - [ ] Explore lock-free maps for the keydir (DashMap / evmap) afterwards.
 
 ## Phase 6 — Measure

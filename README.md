@@ -6,9 +6,9 @@ follows the [PingCAP Talent Plan](https://github.com/pingcap/talent-plan)
 `kvs` project structure.
 
 **Status: WIP.** Working: multi-file log with rotation, crash-safe
-compaction, hint files for fast startup, and a concurrent API (one writer,
-many readers). Next: moving the merge to a background thread — see
-[ROADMAP.md](ROADMAP.md).
+compaction on a background thread, hint files for fast startup, and a
+concurrent API (one writer, many readers). Next: benchmarks and a lock-free
+keydir — see [ROADMAP.md](ROADMAP.md).
 
 ## How it works
 
