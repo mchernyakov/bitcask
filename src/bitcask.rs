@@ -361,6 +361,8 @@ impl Loader {
                         RecordRead::Record { position: _, bytes } => {
                             match IndexValue::deserialize(&bytes, file_id) {
                                 Ok((key, value, _)) => {
+                                    // hints hold one record per live key, so
+                                    // a plain insert (no get_mut-first) wins
                                     self.index.insert(key.to_vec(), value);
                                     debug!("replayed hint: {:?}", key);
                                 }
@@ -402,16 +404,18 @@ impl Loader {
                         let (deserialized, _) = Command::deserialize(&bytes)?;
                         match deserialized {
                             Command::Set { ts, key, .. } => {
-                                let file_id_copy = file_id;
-                                self.index.insert(
-                                    key.to_vec(),
-                                    IndexValue {
-                                        file_id: file_id_copy,
-                                        ts,
-                                        offset: position,
-                                        len: bytes.len(),
-                                    },
-                                );
+                                let value = IndexValue {
+                                    file_id,
+                                    ts,
+                                    offset: position,
+                                    len: bytes.len(),
+                                };
+                                match self.index.get_mut(key) {
+                                    Some(slot) => *slot = value,
+                                    None => {
+                                        self.index.insert(key.to_vec(), value);
+                                    }
+                                }
                                 debug!("replayed SET: {:?}", deserialized);
                             }
                             Command::Rm { key, .. } => {
@@ -508,8 +512,15 @@ impl Bitcask {
                 };
 
                 let mut index_writer = self.handle.shared.index_write()?;
-                if let Some(old) = index_writer.insert(command.get_key().to_vec(), index_value) {
-                    single_writer.stale_bytes_count += old.len as u64;
+
+                match index_writer.get_mut(command.get_key()) {
+                    Some(old) => {
+                        single_writer.stale_bytes_count += old.len as u64;
+                        *old = index_value;
+                    }
+                    None => {
+                        index_writer.insert(command.get_key().to_vec(), index_value);
+                    }
                 }
             }
             Command::Rm { ts: _, key } => {
@@ -750,11 +761,11 @@ impl KvStore for Bitcask {
             file.read_exact_at(&mut buf, entry.offset)?;
 
             let (deserialized, _) = Command::deserialize(&buf)?;
-            let cmd = deserialized.get_value();
-            return match cmd {
-                Some(value) => Ok(Some(String::from_utf8(value.to_vec())?)),
-                None => Ok(None),
+            let Some(value_len) = deserialized.get_value().map(<[u8]>::len) else {
+                return Ok(None);
             };
+            buf.drain(..buf.len() - value_len);
+            return Ok(Some(String::from_utf8(buf)?));
         }
     }
 }
