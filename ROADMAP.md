@@ -87,7 +87,7 @@ Bitcask's model: exactly one writer, many readers.
 Ideas noted along the way. Measure first (Phase 6), then decide — none of
 these are worth doing on a hunch.
 
-- [ ] Reusable record buffer: `RecordReader::next_record` lends `&[u8]` into
+- [x] Reusable record buffer: `RecordReader::next_record` lends `&[u8]` into
   an internal buffer instead of allocating a `Vec` per record (replay and
   merge touch every record). Lending pattern — can't be a std `Iterator`.
 - [ ] Rebuild `stale_bytes_count` fully on startup: replay counts tombstones
@@ -97,15 +97,11 @@ these are worth doing on a hunch.
   rewriting every sealed file on each merge.
 - [ ] Write hint files on rotation too (not only during merges), so every
   sealed file starts up at O(live keys).
-- [ ] Fewer fsyncs during merge: sync once per finished output file instead
-  of once per source file.
+- [x] Fewer fsyncs during merge: sync once per finished output file instead
+  of once per source file. (Fell out of the Phase 5 merge redesign: the only
+  sync is in `finish_output`, per finished output.)
 - [ ] Value-only reads in `get` (keydir stores value position/length like the
   paper) — halves read I/O for large keys, but gives up the per-read CRC
   check over the whole record. Decide with benchmark numbers in hand.
 - [ ] `MAX_RECORD_SIZE` sanity cap, enforced in `set` and checked on read
   (defense-in-depth leftover from Phase 1).
-
-## Possible continuations
-
-Network server/client, thread pools, async — the later PingCAP Talent Plan
-projects are a natural extension after Phase 5.

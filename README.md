@@ -5,24 +5,60 @@ key/value store, written from scratch in Rust as a learning project. Loosely
 follows the [PingCAP Talent Plan](https://github.com/pingcap/talent-plan)
 `kvs` project structure.
 
-**Status: WIP.** Working: multi-file log with rotation, crash-safe
-compaction on a background thread, hint files for fast startup, and a
-concurrent API (one writer, many readers). Next: benchmarks and a lock-free
-keydir — see [ROADMAP.md](ROADMAP.md).
+**Status:** the engine is done — multi-file log with rotation, crash-safe
+background compaction, hint files, a concurrent API (one writer, many
+readers), criterion benchmarks. Next: a lock-free keydir, then a network
+layer.
 
-## How it works
+## Design
 
 Writes append records to an active log file that rolls over at a size
-threshold; sealed files are immutable. An in-memory index (the "keydir") maps
-each key to its latest record, so a read is a single `pread`. Stale data is
-reclaimed by merging sealed files, and each merge output gets a `*.hint`
-sibling so startup can load the index without replaying full logs. Every
-record carries a CRC: torn tails are truncated on startup, any other
-corruption fails `open` instead of serving damaged data.
+threshold; sealed files are immutable. An in-memory index (the "keydir")
+maps each key to `(file_id, offset, len, ts)` of its latest record, so a
+read is a single `pread`. A background merge reclaims stale data from sealed
+files. Each merge output gets a `*.hint` sibling, so startup loads the index
+at ~O(live keys) instead of replaying full logs.
 
 Record format (little-endian):
 
     [u32 crc][u32 body_len][u64 ts][u8 type][u32 key_len][key][u32 value_len][value]
+
+Notes on the tricky parts:
+
+**Concurrency — one writer, many readers.**
+- `Bitcask` is a cheap-clone `Arc` handle with `&self` methods. A
+  `Mutex<WriterState>` keeps writes single-threaded; a lock file (`flock`)
+  keeps the directory single-process.
+- A read takes a short keydir read lock, then `pread`s a shared `Arc<File>`
+  — no lock held during I/O. If a merge deletes the file mid-read, the open
+  handle still works (unlink semantics); if the keydir entry went stale, the
+  read retries.
+- Read-your-writes without fsync: the active file has no write buffer —
+  `write(2)` first, keydir insert second. A published entry is always
+  readable via the page cache. Visibility and durability are separate.
+
+**Crash safety — every record has a CRC.**
+- A torn tail on the active file is truncated on open. Corruption anywhere
+  else fails `open` instead of serving bad data. A corrupt hint file is
+  deleted and its data file replayed.
+- Merge writes to `*.data.compact`, then per output: fsync → rename →
+  publish. Originals are deleted last. A crash at any step leaves a state
+  `open()` recovers from: leftover `.compact` files are removed, and output
+  ids sit below the active file, so "later file id wins" replay stays
+  correct.
+- A merge running while the writer rotates would break that id order, so
+  the merge reserves its output ids up front and the writer rotates above
+  them before copying starts.
+
+**Durability is a policy**: fsync on every put, on an interval, or let the
+OS decide. Only the writer syncs.
+
+Numbers so far: set ~1.6 µs / get ~0.6 µs (`OsDecides`, criterion); fsync
+per put ~4 ms; background merge gave 6.6× write throughput under constant
+merges.
+
+**Limitations** (mostly Bitcask's own trade-offs): all keys live in RAM; no
+range scans; one process per directory; Unix-only (`pread`, `flock`).
 
 ## Usage
 

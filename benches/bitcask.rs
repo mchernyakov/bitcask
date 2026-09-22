@@ -14,6 +14,10 @@ use kvs::{Bitcask, Config, DurabilityPolicy, KvStore};
 use std::fs;
 use std::hint::black_box;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier};
+use std::thread;
+use std::time::Instant;
 use tempfile::TempDir;
 
 const VALUE: &str = "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"; // 32 bytes
@@ -143,5 +147,122 @@ fn bench_open(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_set, bench_get, bench_open);
+// The concurrency numbers Phase 5 exists to produce. Two views:
+//
+// - get_latency_under_load: cost of one get on the measured thread while
+//   background threads hold the same locks. Uncontended get is the baseline;
+//   lock choice (RwLock vs DashMap vs ...) only shows up here and below.
+// - get_throughput_scaling: aggregate gets/sec across N threads. Near-linear
+//   scaling means RwLock<HashMap> is fine; a plateau or dip is the
+//   with-numbers case for a sharded/lock-free keydir.
+fn bench_get_concurrent(c: &mut Criterion) {
+    let dir = TempDir::new().unwrap();
+    let store = Bitcask::open(Config {
+        file_size_threshold: 64 << 10,
+        compaction_threshold: u64::MAX,
+        ..Config::new(dir.path())
+    })
+    .unwrap();
+    for i in 0..10_000 {
+        store.set(&format!("key{i}"), VALUE).unwrap();
+    }
+
+    let mut group = c.benchmark_group("get_latency_under_load");
+    group.throughput(Throughput::Elements(1));
+    // writer variant last: its appends grow the store for later samples
+    for (name, background_readers, background_writer) in [
+        ("solo", 0usize, false),
+        ("3_readers", 3, false),
+        ("7_readers", 7, false),
+        ("3_readers_1_writer", 3, true),
+    ] {
+        group.bench_function(name, |b| {
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut handles = Vec::new();
+            for t in 0..background_readers {
+                let store = store.clone();
+                let stop = Arc::clone(&stop);
+                handles.push(thread::spawn(move || {
+                    let mut i = t as u64 * 1_000;
+                    while !stop.load(Ordering::Relaxed) {
+                        i = (i + 7919) % 10_000;
+                        black_box(store.get(&format!("key{i}")).unwrap());
+                    }
+                }));
+            }
+            if background_writer {
+                let store = store.clone();
+                let stop = Arc::clone(&stop);
+                handles.push(thread::spawn(move || {
+                    let mut i = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        i = (i + 1) % 10_000;
+                        store.set(&format!("key{i}"), VALUE).unwrap();
+                    }
+                }));
+            }
+
+            let mut i = 0u64;
+            b.iter(|| {
+                i = (i + 7919) % 10_000;
+                black_box(store.get(&format!("key{i}")).unwrap())
+            });
+
+            stop.store(true, Ordering::Relaxed);
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+    }
+    group.finish();
+
+    let mut group = c.benchmark_group("get_throughput_scaling");
+    group.throughput(Throughput::Elements(1));
+    group.sample_size(30);
+    for n_threads in [1usize, 2, 4, 8] {
+        group.bench_function(format!("{n_threads}_threads"), |b| {
+            b.iter_custom(|iters| {
+                let per_thread = iters.div_ceil(n_threads as u64);
+                let total = per_thread * n_threads as u64;
+                let barrier = Arc::new(Barrier::new(n_threads));
+
+                let mut handles = Vec::new();
+                for t in 1..n_threads {
+                    let store = store.clone();
+                    let barrier = Arc::clone(&barrier);
+                    handles.push(thread::spawn(move || {
+                        let mut i = t as u64 * 1_000;
+                        barrier.wait();
+                        for _ in 0..per_thread {
+                            i = (i + 7919) % 10_000;
+                            black_box(store.get(&format!("key{i}")).unwrap());
+                        }
+                    }));
+                }
+
+                barrier.wait();
+                let start = Instant::now();
+                let mut i = 0u64;
+                for _ in 0..per_thread {
+                    i = (i + 7919) % 10_000;
+                    black_box(store.get(&format!("key{i}")).unwrap());
+                }
+                for handle in handles {
+                    handle.join().unwrap();
+                }
+                // measured wall time covers `total` gets; scale to `iters`
+                start.elapsed().mul_f64(iters as f64 / total as f64)
+            })
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_set,
+    bench_get,
+    bench_open,
+    bench_get_concurrent
+);
 criterion_main!(benches);
