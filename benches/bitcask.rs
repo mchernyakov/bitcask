@@ -82,13 +82,16 @@ fn bench_get(c: &mut Criterion) {
         store.set(&format!("key{i}"), VALUE).unwrap();
     }
 
+    // keys pre-generated: the timed loop must not measure format!/allocation
+    let keys: Vec<String> = (0..10_000).map(|i| format!("key{i}")).collect();
+
     let mut group = c.benchmark_group("get");
     group.throughput(Throughput::Elements(1));
     group.bench_function("across_files", |b| {
-        let mut i: u64 = 0;
+        let mut i: usize = 0;
         b.iter(|| {
             i = (i + 7919) % 10_000; // stride co-prime to 10_000: visits every key
-            black_box(store.get(&format!("key{i}")).unwrap())
+            black_box(store.get(&keys[i]).unwrap())
         });
     });
     group.finish();
@@ -167,6 +170,9 @@ fn bench_get_concurrent(c: &mut Criterion) {
         store.set(&format!("key{i}"), VALUE).unwrap();
     }
 
+    // keys pre-generated: the timed loops must not measure format!/allocation
+    let keys: Arc<Vec<String>> = Arc::new((0..10_000).map(|i| format!("key{i}")).collect());
+
     let mut group = c.benchmark_group("get_latency_under_load");
     group.throughput(Throughput::Elements(1));
     // writer variant last: its appends grow the store for later samples
@@ -182,30 +188,32 @@ fn bench_get_concurrent(c: &mut Criterion) {
             for t in 0..background_readers {
                 let store = store.clone();
                 let stop = Arc::clone(&stop);
+                let keys = Arc::clone(&keys);
                 handles.push(thread::spawn(move || {
-                    let mut i = t as u64 * 1_000;
+                    let mut i = t * 1_000;
                     while !stop.load(Ordering::Relaxed) {
                         i = (i + 7919) % 10_000;
-                        black_box(store.get(&format!("key{i}")).unwrap());
+                        black_box(store.get(&keys[i]).unwrap());
                     }
                 }));
             }
             if background_writer {
                 let store = store.clone();
                 let stop = Arc::clone(&stop);
+                let keys = Arc::clone(&keys);
                 handles.push(thread::spawn(move || {
-                    let mut i = 0u64;
+                    let mut i = 0usize;
                     while !stop.load(Ordering::Relaxed) {
                         i = (i + 1) % 10_000;
-                        store.set(&format!("key{i}"), VALUE).unwrap();
+                        store.set(&keys[i], VALUE).unwrap();
                     }
                 }));
             }
 
-            let mut i = 0u64;
+            let mut i = 0usize;
             b.iter(|| {
                 i = (i + 7919) % 10_000;
-                black_box(store.get(&format!("key{i}")).unwrap())
+                black_box(store.get(&keys[i]).unwrap())
             });
 
             stop.store(true, Ordering::Relaxed);
@@ -230,22 +238,23 @@ fn bench_get_concurrent(c: &mut Criterion) {
                 for t in 1..n_threads {
                     let store = store.clone();
                     let barrier = Arc::clone(&barrier);
+                    let keys = Arc::clone(&keys);
                     handles.push(thread::spawn(move || {
-                        let mut i = t as u64 * 1_000;
+                        let mut i = t * 1_000;
                         barrier.wait();
                         for _ in 0..per_thread {
                             i = (i + 7919) % 10_000;
-                            black_box(store.get(&format!("key{i}")).unwrap());
+                            black_box(store.get(&keys[i]).unwrap());
                         }
                     }));
                 }
 
                 barrier.wait();
                 let start = Instant::now();
-                let mut i = 0u64;
+                let mut i = 0usize;
                 for _ in 0..per_thread {
                     i = (i + 7919) % 10_000;
-                    black_box(store.get(&format!("key{i}")).unwrap());
+                    black_box(store.get(&keys[i]).unwrap());
                 }
                 for handle in handles {
                     handle.join().unwrap();

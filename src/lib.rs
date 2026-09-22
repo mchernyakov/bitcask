@@ -14,3 +14,4 @@ mod kvstore;
 mod lock_file;
 mod policy;
 mod record_reader;
+mod index;

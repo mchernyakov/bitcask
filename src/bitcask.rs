@@ -1,11 +1,14 @@
 use crate::command::Command;
 use crate::config::Config;
+use crate::index::Index;
+use crate::index::INDEX_BUCKETS_NUM;
 use crate::index_value::IndexValue;
 use crate::kvstore::KvStore;
 use crate::lock_file::LockFile;
 use crate::policy::DurabilityPolicy;
 use crate::record_reader::{RecordRead, RecordReader};
 use crate::{KvsError, Result};
+use arc_swap::ArcSwap;
 use log::{debug, trace};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -13,7 +16,7 @@ use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::mpsc::{sync_channel, SyncSender};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs, thread};
@@ -48,10 +51,10 @@ impl Drop for Handle {
     }
 }
 
-// !!! lock order rule: writer → readers → index !!!
+// !!! lock order rule: writer → index(bucket) !!!
 struct Shared {
-    index: RwLock<HashMap<Vec<u8>, IndexValue>>,
-    readers: RwLock<BTreeMap<u64, Arc<File>>>,
+    index: Index,
+    readers: ArcSwap<BTreeMap<u64, Arc<File>>>,
     // the single writer
     writer: Mutex<WriterState>,
     config: Config,
@@ -76,35 +79,22 @@ impl Shared {
         Ok(())
     }
 
+    fn readers_update(&self, mutate: impl Fn(&mut BTreeMap<u64, Arc<File>>)) {
+        self.readers.rcu(|old| {
+            let mut map = BTreeMap::clone(old);
+            mutate(&mut map);
+            map
+        });
+    }
+
     fn writer_lock(&self) -> Result<MutexGuard<'_, WriterState>> {
         trace!("acquiring lock; struct {}, type {}", "writer", "WRITE");
         self.writer.lock().map_err(|_| KvsError::LockPoisoned)
     }
 
-    fn readers_read(&self) -> Result<std::sync::RwLockReadGuard<'_, BTreeMap<u64, Arc<File>>>> {
-        trace!("acquiring lock; struct {}, type {}", "readers", "READ");
-        self.readers.read().map_err(|_| KvsError::LockPoisoned)
-    }
-
-    fn readers_write(&self) -> Result<std::sync::RwLockWriteGuard<'_, BTreeMap<u64, Arc<File>>>> {
-        trace!("acquiring lock; struct {}, type {}", "readers", "WRITE");
-        self.readers.write().map_err(|_| KvsError::LockPoisoned)
-    }
-
-    fn index_read(&self) -> Result<std::sync::RwLockReadGuard<'_, HashMap<Vec<u8>, IndexValue>>> {
-        trace!("acquiring lock; struct {}, type {}", "index", "READ");
-        self.index.read().map_err(|_| KvsError::LockPoisoned)
-    }
-
-    fn index_write(&self) -> Result<std::sync::RwLockWriteGuard<'_, HashMap<Vec<u8>, IndexValue>>> {
-        trace!("acquiring lock; struct {}, type {}", "index", "WRITE");
-        self.index.write().map_err(|_| KvsError::LockPoisoned)
-    }
-
     fn rotate_to(
         &self,
         single_writer: &mut MutexGuard<WriterState>,
-        readers: &mut BTreeMap<u64, Arc<File>>,
         next_file_id: u64,
     ) -> Result<()> {
         self.sync(single_writer)?;
@@ -124,7 +114,9 @@ impl Shared {
 
         let next_file_reader = OpenOptions::new().read(true).open(&next_file)?;
         let reader = Arc::new(next_file_reader);
-        readers.insert(next_file_id, reader);
+        self.readers_update(|m| {
+            m.insert(next_file_id, Arc::clone(&reader));
+        });
         Ok(())
     }
 
@@ -132,12 +124,7 @@ impl Shared {
         if single_writer.offset < self.config.file_size_threshold {
             return Ok(());
         }
-        let mut readers = self.readers_write()?;
-        self.rotate_to(
-            single_writer,
-            &mut readers,
-            single_writer.current_file_id + 1,
-        )?;
+        self.rotate_to(single_writer, single_writer.current_file_id + 1)?;
         Ok(())
     }
 
@@ -154,7 +141,7 @@ impl Shared {
                 writer.stale_bytes_count
             );
 
-            let mut readers = self.readers_write()?;
+            let readers = self.readers.load_full();
             let mut snapshot: Vec<(u64, Arc<File>)> = Vec::new();
             for (&id, file) in &mut readers.iter() {
                 if id == writer.current_file_id {
@@ -175,7 +162,7 @@ impl Shared {
 
             let next_active = writer.current_file_id + reserve + 1;
             let prev_file_id = writer.current_file_id;
-            self.rotate_to(&mut writer, &mut readers, next_active)?;
+            self.rotate_to(&mut writer, next_active)?;
             (snapshot, stale, prev_file_id)
         };
 
@@ -231,10 +218,10 @@ impl Shared {
                         match cmd_deserialized {
                             Command::Set { ts, key, .. } => {
                                 // if the key is in the index, append to the compaction file
-                                let sits_in_index = self
-                                    .index_read()?
-                                    .get(key)
-                                    .is_some_and(|e| e.file_id == *file_id && e.offset == position);
+                                let sits_in_index =
+                                    self.index.read_access(key)?.get(key).is_some_and(|e| {
+                                        e.file_id == *file_id && e.offset == position
+                                    });
 
                                 if sits_in_index {
                                     let new_index_value = out.append(bytes, key, ts)?;
@@ -296,16 +283,13 @@ impl Shared {
         }
 
         for id in ids_to_remove {
-            if let Some(file) = self.readers_write()?.remove(&id) {
-                drop(file);
-                let path_to_remove = self.config.dir.join(data_file_name(id));
-                fs::remove_file(path_to_remove)?;
+            let path_to_remove = self.config.dir.join(data_file_name(id));
+            fs::remove_file(path_to_remove)?;
 
-                // remove associated hint file
-                let hint_path = self.config.dir.join(hint_file_name(id));
-                if hint_path.exists() {
-                    fs::remove_file(hint_path)?;
-                }
+            // remove associated hint file
+            let hint_path = self.config.dir.join(hint_file_name(id));
+            if hint_path.exists() {
+                fs::remove_file(hint_path)?;
             }
         }
 
@@ -320,13 +304,14 @@ impl Shared {
         let new_path = self.config.dir.join(data_file_name(out.id));
         fs::rename(&path, &new_path)?;
 
-        let compacted_file = OpenOptions::new().read(true).open(&new_path)?;
-        self.readers_write()?
-            .insert(out.id, Arc::new(compacted_file));
+        let compacted_file = Arc::new(OpenOptions::new().read(true).open(&new_path)?);
+        self.readers_update(|m| {
+            m.insert(out.id, Arc::clone(&compacted_file));
+        });
 
-        let mut index_write = self.index_write()?;
         for pending_update in pending.drain(..) {
             let key = pending_update.key;
+            let mut index_write = self.index.write_access(&key)?;
             let prev_value = pending_update.previous_value;
             let new_value = pending_update.new;
             let still_prev = index_write
@@ -343,7 +328,7 @@ impl Shared {
 
 struct Loader {
     readers: BTreeMap<u64, Arc<File>>,
-    index: HashMap<Vec<u8>, IndexValue>,
+    index: [HashMap<Vec<u8>, IndexValue>; INDEX_BUCKETS_NUM],
     writer: WriterState,
 }
 
@@ -364,7 +349,8 @@ impl Loader {
                                 Ok((key, value, _)) => {
                                     // hints hold one record per live key, so
                                     // a plain insert (no get_mut-first) wins
-                                    self.index.insert(key.to_vec(), value);
+                                    let bucket_id = Index::get_bucket(key);
+                                    self.index[bucket_id].insert(key.to_vec(), value);
                                     debug!("replayed hint: {:?}", key);
                                 }
                                 Err(_) => {
@@ -411,17 +397,19 @@ impl Loader {
                                     offset: position,
                                     len: bytes.len(),
                                 };
-                                match self.index.get_mut(key) {
+                                let bucket_id = Index::get_bucket(key);
+                                match self.index[bucket_id].get_mut(key) {
                                     Some(slot) => *slot = value,
                                     None => {
-                                        self.index.insert(key.to_vec(), value);
+                                        self.index[bucket_id].insert(key.to_vec(), value);
                                     }
                                 }
                                 debug!("replayed SET: {:?}", deserialized);
                             }
                             Command::Rm { key, .. } => {
+                                let bucket_id = Index::get_bucket(key);
                                 self.writer.stale_bytes_count += bytes.len() as u64;
-                                self.index.remove(key);
+                                self.index[bucket_id].remove(key);
                                 debug!("replayed RM: {:?}", deserialized);
                             }
                         }
@@ -512,9 +500,10 @@ impl Bitcask {
                     len: serialized_command.len(),
                 };
 
-                let mut index_writer = self.handle.shared.index_write()?;
+                let key = command.get_key();
+                let mut index_writer = self.handle.shared.index.write_access(key)?;
 
-                match index_writer.get_mut(command.get_key()) {
+                match index_writer.get_mut(key) {
                     Some(old) => {
                         single_writer.stale_bytes_count += old.len as u64;
                         *old = index_value;
@@ -525,7 +514,7 @@ impl Bitcask {
                 }
             }
             Command::Rm { ts: _, key } => {
-                let mut index_writer = self.handle.shared.index_write()?;
+                let mut index_writer = self.handle.shared.index.write_access(key)?;
                 if let Some(old) = index_writer.remove(*key) {
                     single_writer.stale_bytes_count += old.len as u64;
                 }
@@ -671,7 +660,8 @@ impl KvStore for Bitcask {
         let r_file = OpenOptions::new().read(true).open(&current_path)?;
         read_handlers.insert(current_file_id, Arc::new(r_file));
 
-        let in_mem_index = HashMap::new();
+        let in_mem_index: [HashMap<Vec<u8>, IndexValue>; INDEX_BUCKETS_NUM] =
+            std::array::from_fn(|_| HashMap::new());
 
         let mut loader = Loader {
             readers: read_handlers,
@@ -686,8 +676,8 @@ impl KvStore for Bitcask {
 
         let shared = Arc::new(Shared {
             config,
-            index: RwLock::new(loader.index),
-            readers: RwLock::new(loader.readers),
+            index: Index::from(loader.index),
+            readers: ArcSwap::from_pointee(loader.readers),
             writer: Mutex::new(loader.writer),
             lock_file,
         });
@@ -727,7 +717,13 @@ impl KvStore for Bitcask {
 
     fn remove(&self, key: &str) -> Result<()> {
         let key_bytes = key.as_bytes();
-        if !self.handle.shared.index_read()?.contains_key(key_bytes) {
+        if !self
+            .handle
+            .shared
+            .index
+            .read_access(key_bytes)?
+            .contains_key(key_bytes)
+        {
             return Err(KvsError::KeyNotFound);
         }
 
@@ -742,19 +738,23 @@ impl KvStore for Bitcask {
         let key_bytes = key.as_bytes();
 
         loop {
-            let Some(entry) = self.handle.shared.index_read()?.get(key_bytes).copied() else {
+            let Some(entry) = self
+                .handle
+                .shared
+                .index
+                .read_access(key_bytes)?
+                .get(key_bytes)
+                .copied()
+            else {
                 return Ok(None);
             };
 
             // a merge could delete this file when we acquired the index lock,
-            // we want to retry until both data structures are in sync
-            let Some(file) = self
-                .handle
-                .shared
-                .readers_read()?
-                .get(&entry.file_id)
-                .cloned()
-            else {
+            // we want to retry until both data structures are in sync.
+            // The guard is held across the pread: cloning the Arc<File> out
+            // would bump a refcount shared by every reader of that file.
+            let readers = self.handle.shared.readers.load();
+            let Some(file) = readers.get(&entry.file_id) else {
                 continue;
             };
 
