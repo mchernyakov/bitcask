@@ -3,6 +3,7 @@ use std::fs::{OpenOptions, TryLockError};
 use std::path::Path;
 
 pub struct LockFile {
+    #[allow(dead_code)]
     file: std::fs::File,
 }
 
@@ -12,6 +13,7 @@ impl LockFile {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path)?;
 
         match file.try_lock() {

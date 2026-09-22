@@ -13,7 +13,7 @@ use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::mpsc::{sync_channel, SyncSender};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs, thread};
@@ -55,6 +55,7 @@ struct Shared {
     // the single writer
     writer: Mutex<WriterState>,
     config: Config,
+    #[allow(dead_code)]
     lock_file: LockFile,
 }
 
@@ -226,7 +227,7 @@ impl Shared {
             loop {
                 match data_file_record_reader.next_record()? {
                     RecordRead::Record { position, bytes } => {
-                        let (cmd_deserialized, _) = Command::deserialize(&bytes)?;
+                        let (cmd_deserialized, _) = Command::deserialize(bytes)?;
                         match cmd_deserialized {
                             Command::Set { ts, key, .. } => {
                                 // if the key is in the index, append to the compaction file
@@ -236,7 +237,7 @@ impl Shared {
                                     .is_some_and(|e| e.file_id == *file_id && e.offset == position);
 
                                 if sits_in_index {
-                                    let new_index_value = out.append(&bytes, key, ts)?;
+                                    let new_index_value = out.append(bytes, key, ts)?;
 
                                     let prev_index_value = IndexValue {
                                         file_id: *file_id,
@@ -359,7 +360,7 @@ impl Loader {
                 let hint_processed = loop {
                     match hint_record_reader.next_record()? {
                         RecordRead::Record { position: _, bytes } => {
-                            match IndexValue::deserialize(&bytes, file_id) {
+                            match IndexValue::deserialize(bytes, file_id) {
                                 Ok((key, value, _)) => {
                                     // hints hold one record per live key, so
                                     // a plain insert (no get_mut-first) wins
@@ -401,7 +402,7 @@ impl Loader {
             loop {
                 match data_file_record_reader.next_record()? {
                     RecordRead::Record { position, bytes } => {
-                        let (deserialized, _) = Command::deserialize(&bytes)?;
+                        let (deserialized, _) = Command::deserialize(bytes)?;
                         match deserialized {
                             Command::Set { ts, key, .. } => {
                                 let value = IndexValue {
@@ -1000,6 +1001,180 @@ mod tests {
             !fs::exists(dir.path().join("000001.hint"))?,
             "damaged hint file should be removed during fallback"
         );
+
+        Ok(())
+    }
+
+    // --- crash-window recovery: each test constructs the exact directory
+    // --- state a crash leaves at one step of the background merge and
+    // --- asserts open() recovers correct values and a usable store.
+
+    // Crash mid-merge, before any rename: sources intact, a half-written
+    // .compact output, its hint (an orphan — no matching .data), and the
+    // empty active file the merge created at snapshot time.
+    #[test_log::test]
+    fn crash_before_merge_rename_recovers_from_sources() -> Result<()> {
+        let dir = tempdir()?;
+
+        let src1 = Command::Set {
+            ts: 1,
+            key: b"k1",
+            value: b"a",
+        }
+        .serialize();
+        fs::write(dir.path().join("000001.data"), &src1)?;
+
+        let src2 = Command::Set {
+            ts: 2,
+            key: b"k2",
+            value: b"b",
+        }
+        .serialize();
+        fs::write(dir.path().join("000002.data"), &src2)?;
+
+        fs::write(
+            dir.path().join("000005.data.compact"),
+            b"half-written merge output",
+        )?;
+        fs::write(dir.path().join("000005.hint"), b"half-written hint")?;
+        fs::write(dir.path().join("000010.data"), b"")?;
+
+        let bitcask = Bitcask::open(Config::new(dir.path()))?;
+
+        assert_eq!(bitcask.get("k1")?, Some("a".to_owned()));
+        assert_eq!(bitcask.get("k2")?, Some("b".to_owned()));
+        assert!(
+            !fs::exists(dir.path().join("000005.data.compact"))?,
+            ".compact leftover should be removed on open"
+        );
+        assert!(
+            !fs::exists(dir.path().join("000005.hint"))?,
+            "orphan hint of the unfinished output should be removed on open"
+        );
+
+        // store stays usable across another cycle
+        bitcask.set("k3", "c")?;
+        drop(bitcask);
+        let bitcask = Bitcask::open(Config::new(dir.path()))?;
+        assert_eq!(bitcask.get("k1")?, Some("a".to_owned()));
+        assert_eq!(bitcask.get("k3")?, Some("c".to_owned()));
+
+        Ok(())
+    }
+
+    fn merged_output(dir: &Path) -> Result<()> {
+        // the live records at merge time: k's latest (copied from file 2)
+        // and k2's only version (copied from file 1)
+        let rec_k = Command::Set {
+            ts: 3,
+            key: b"k",
+            value: b"new",
+        }
+        .serialize();
+        let rec_k2 = Command::Set {
+            ts: 1,
+            key: b"k2",
+            value: b"x",
+        }
+        .serialize();
+
+        let mut output = rec_k.clone();
+        output.extend_from_slice(&rec_k2);
+        fs::write(dir.join("000003.data"), &output)?;
+
+        let mut hint = IndexValue {
+            file_id: 3,
+            ts: 3,
+            offset: 0,
+            len: rec_k.len(),
+        }
+        .serialize(b"k");
+        hint.extend_from_slice(
+            &IndexValue {
+                file_id: 3,
+                ts: 1,
+                offset: rec_k.len() as u64,
+                len: rec_k2.len(),
+            }
+            .serialize(b"k2"),
+        );
+        fs::write(dir.join("000003.hint"), &hint)?;
+
+        fs::write(dir.join("000010.data"), b"")?;
+        Ok(())
+    }
+
+    // Crash after the outputs were renamed to .data but before any source
+    // was deleted: sources and outputs coexist; the outputs' higher ids must
+    // win over the stale copies in the sources.
+    #[test_log::test]
+    fn crash_after_rename_before_deletion_prefers_outputs() -> Result<()> {
+        let dir = tempdir()?;
+
+        let old_k = Command::Set {
+            ts: 1,
+            key: b"k",
+            value: b"old",
+        }
+        .serialize();
+        let mut src1 = old_k.clone();
+        src1.extend_from_slice(
+            &Command::Set {
+                ts: 1,
+                key: b"k2",
+                value: b"x",
+            }
+            .serialize(),
+        );
+        fs::write(dir.path().join("000001.data"), &src1)?;
+
+        let src2 = Command::Set {
+            ts: 3,
+            key: b"k",
+            value: b"new",
+        }
+        .serialize();
+        fs::write(dir.path().join("000002.data"), &src2)?;
+
+        merged_output(dir.path())?;
+
+        let bitcask = Bitcask::open(Config::new(dir.path()))?;
+
+        assert_eq!(
+            bitcask.get("k")?,
+            Some("new".to_owned()),
+            "stale copy in an undeleted source must not win"
+        );
+        assert_eq!(bitcask.get("k2")?, Some("x".to_owned()));
+
+        Ok(())
+    }
+
+    // Crash midway through source deletion: one source already gone, one
+    // still present. Same guarantee as above.
+    #[test_log::test]
+    fn crash_during_source_deletion_prefers_outputs() -> Result<()> {
+        let dir = tempdir()?;
+
+        // source 000001.data already deleted; 000002.data survived the crash
+        let src2 = Command::Set {
+            ts: 3,
+            key: b"k",
+            value: b"new",
+        }
+        .serialize();
+        fs::write(dir.path().join("000002.data"), &src2)?;
+
+        merged_output(dir.path())?;
+
+        let bitcask = Bitcask::open(Config::new(dir.path()))?;
+
+        assert_eq!(bitcask.get("k")?, Some("new".to_owned()));
+        assert_eq!(bitcask.get("k2")?, Some("x".to_owned()));
+
+        // and the next merge cycle can still clean up: store stays writable
+        bitcask.set("k3", "y")?;
+        assert_eq!(bitcask.get("k3")?, Some("y".to_owned()));
 
         Ok(())
     }
