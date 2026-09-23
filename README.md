@@ -7,8 +7,7 @@ follows the [PingCAP Talent Plan](https://github.com/pingcap/talent-plan)
 
 **Status:** the engine is done — multi-file log with rotation, crash-safe
 background compaction, hint files, a concurrent API (one writer, many
-readers), criterion benchmarks. Next: a lock-free keydir, then a network
-layer.
+readers, sharded keydir), criterion benchmarks. Next: a network layer.
 
 ## Design
 
