@@ -1,4 +1,4 @@
-use crate::command::{Command, HEADER_LEN};
+use super::command::{Command, HEADER_LEN};
 use crate::Result;
 use std::io;
 use std::io::Read;

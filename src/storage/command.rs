@@ -14,7 +14,7 @@
 //! (torn writes) and `Corruption` for records whose bytes don't match
 //! their crc — callers rely on that distinction.
 
-use crate::bytes_util::BytesUtil;
+use super::bytes_util::BytesUtil;
 use crate::{KvsError, Result};
 use std::convert::TryFrom;
 use std::io;

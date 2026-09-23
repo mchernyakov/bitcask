@@ -1,4 +1,4 @@
-use crate::config::Config;
+use super::config::Config;
 
 pub trait KvStore: Sized + Clone + Send + 'static {
     fn open(config: Config) -> crate::Result<Self>

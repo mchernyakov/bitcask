@@ -8,3 +8,4 @@ target/
 .data
 .hint
 /kvs
+AGENTS.md

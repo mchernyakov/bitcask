@@ -8,7 +8,7 @@
 //! file it describes (000001.hint -> 000001.data), so the id comes from the
 //! file name and is supplied to `deserialize` by the caller.
 
-use crate::bytes_util::BytesUtil;
+use super::bytes_util::BytesUtil;
 use crate::{KvsError, Result};
 use std::io;
 

@@ -1,4 +1,4 @@
-use crate::policy::DurabilityPolicy;
+use super::policy::DurabilityPolicy;
 use std::path::PathBuf;
 
 const COMPACTION_THRESHOLD: u64 = 1 << 20; // 1 MB

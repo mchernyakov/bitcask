@@ -1,4 +1,4 @@
-use crate::index_value::IndexValue;
+use super::index_value::IndexValue;
 use crate::{KvsError, Result};
 use log::trace;
 use std::collections::HashMap;

@@ -110,11 +110,11 @@ Turn the library into a database. The `Clone + Send + 'static` handle from
 Phase 5 is exactly the engine shape a multithreaded server needs — this phase
 is why project 4 demands that signature.
 
-- [ ] `kvs-server` / `kvs-client` binaries (clap) speaking a custom binary
+- [x] `kvs-server` / `kvs-client` binaries (clap) speaking a custom binary
   protocol over TCP. Hand-roll the wire format first (length-prefixed frames,
   request/response enums, explicit encode/decode) before reaching for serde —
   the framing and partial-read handling *is* the lesson.
-- [ ] Typed errors across the wire: a server-side `KvsError` arrives at the
+- [x] Typed errors across the wire: a server-side `KvsError` arrives at the
   client as a typed error, not a string.
 - [ ] `KvsEngine` trait with a second implementation (`sled`) behind it;
   criterion benchmark ours vs. sled at several value sizes and read/write

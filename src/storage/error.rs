@@ -34,6 +34,11 @@ pub enum KvsError {
     /// Another process (or a live handle in this one) owns the store directory.
     #[error("Store is locked by another process")]
     StoreLocked,
+    #[error("Invalid data: {0}")]
+    InvalidData(String),
+    /// The server failed for a reason it doesn't expose (I/O, corruption, ...) -- produced only on the client side error.
+    #[error("Internal server error")]
+    ServerInternal,
 }
 
 /// Result type for kvs.

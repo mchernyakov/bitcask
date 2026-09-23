@@ -1,21 +1,16 @@
 use kvs::Bitcask;
 use kvs::Config;
 use kvs::KvStore;
-use rustyline::DefaultEditor;
+use kvs::ReplCommand;
 use rustyline::error::ReadlineError;
-use tracing_subscriber::EnvFilter;
+use rustyline::DefaultEditor;
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("kvs=info")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    kvs::log::configure_logger();
 
     let mut rl = DefaultEditor::new().unwrap();
 
-    print_help();
+    kvs::print_help();
 
     let kvstore = match Bitcask::open(Config::new("kvs/")) {
         Ok(store) => store,
@@ -39,11 +34,14 @@ fn main() {
                 match line {
                     "quit" | "exit" => break,
                     "help" => {
-                        print_help();
+                        kvs::print_help();
                     }
-                    _ => {
-                        execute_command(line, &kvstore);
-                    }
+                    _ => match kvs::parse_command(line) {
+                        Some(ReplCommand::Set { key, value }) => set(key, value, &kvstore),
+                        Some(ReplCommand::Get { key }) => get(key, &kvstore),
+                        Some(ReplCommand::Rm { key }) => rm(key, &kvstore),
+                        None => {}
+                    },
                 }
             }
 
@@ -64,75 +62,6 @@ fn main() {
             }
         }
     }
-}
-
-fn execute_command(input: &str, kvstore: &impl KvStore) {
-    let mut parts = input.split_whitespace();
-
-    let command = match parts.next() {
-        Some(command) => command,
-        None => return,
-    };
-
-    match command {
-        "set" => {
-            let key = match parts.next() {
-                Some(key) => key,
-                None => {
-                    eprintln!("Usage: set <KEY> <VALUE>");
-                    return;
-                }
-            };
-
-            let value = match parts.next() {
-                Some(value) => value,
-                None => {
-                    eprintln!("Usage: set <KEY> <VALUE>");
-                    return;
-                }
-            };
-
-            set(key, value, kvstore);
-        }
-
-        "get" => {
-            let key = match parts.next() {
-                Some(key) => key,
-                None => {
-                    eprintln!("Usage: get <KEY>");
-                    return;
-                }
-            };
-
-            get(key, kvstore);
-        }
-
-        "rm" => {
-            let key = match parts.next() {
-                Some(key) => key,
-                None => {
-                    eprintln!("Usage: rm <KEY>");
-                    return;
-                }
-            };
-
-            rm(key, kvstore);
-        }
-
-        _ => {
-            eprintln!("Unknown command: {}", command);
-            eprintln!("Type 'help' for available commands.");
-        }
-    }
-}
-
-fn print_help() {
-    println!("Available commands:");
-    println!("  set <KEY> <VALUE>  Set the value of a key");
-    println!("  get <KEY>          Get the value of a key");
-    println!("  rm <KEY>           Remove a key");
-    println!("  help               Show this help");
-    println!("  quit               Exit");
 }
 
 fn set(key: &str, value: &str, kvstore: &impl KvStore) {

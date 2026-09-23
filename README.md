@@ -87,7 +87,39 @@ on an interval / OS decides), `file_size_threshold` (rotation size),
 `compaction_threshold` (stale bytes that trigger a merge), and
 `flush_threshold_millis` (the interval for `SyncOnInterval`).
 
-There's also a small interactive REPL: `cargo run --bin kvs`.
+## Binaries
+
+The crate builds three binaries; `cargo build --bins` builds all of them
+into `target/debug/`.
+
+| Binary | What it is | Run |
+|---|---|---|
+| `kvs` | Interactive REPL over a local store (default `kvs/`) | `cargo run` |
+| `kvs-server` | TCP server exposing a store | `cargo run --bin kvs-server` |
+| `kvs-client` | Interactive REPL that talks to a server | `cargo run --bin kvs-client` |
+
+`kvs` is the default run target. The REPL commands are the same locally and
+over the network: `set <KEY> <VALUE>`, `get <KEY>`, `rm <KEY>`, `help`,
+`quit` (or Ctrl-D).
+
+Server options:
+
+```
+kvs-server [--addr <ADDR>] [--dir <DIR>]
+  --addr   address to listen on   (default 127.0.0.1:4000)
+  --dir    store directory        (default kvs/)
+```
+
+Client options:
+
+```
+kvs-client [--addr <ADDR>]
+  --addr   server address         (default 127.0.0.1:4000)
+```
+
+Pass options after `--` when using `cargo run`, e.g.
+`cargo run --bin kvs-server -- --addr 0.0.0.0:5000 --dir ./data`. Logging
+goes to stderr and is controlled with `RUST_LOG` (default `kvs=info`).
 
 ## Tests
 
