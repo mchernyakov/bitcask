@@ -122,7 +122,7 @@ is why project 4 demands that signature.
   `Config::store_type` / `--store-type`, dispatched through the `Store` enum
   (static dispatch over a closed set, no `dyn`). The lock file carries an
   engine marker so a directory can't be opened by the wrong engine.
-- [ ] Run the engine benchmark and write down *why* sled differs (its page
+- [x] Run the engine benchmark and write down *why* sled differs (its page
   cache, `insert` returning the old value, flush cadence vs. our durability
   policies). Reading sled's docs for this is half the value of the item above.
 - [ ] Stretch with a big payoff: speak a subset of RESP instead of (or beside)
@@ -207,6 +207,38 @@ these are worth doing on a hunch.
 - [ ] `MAX_RECORD_SIZE` sanity cap, enforced in `set` and checked on read —
   today `get` allocates `vec![0; entry.len]` with a length that ultimately
   comes from a hint file.
+
+### Write path: fewer syscalls, same guarantees
+
+What the Phase 7 engine benchmark said (`benches/engines.rs`, 4096 keys,
+`SyncOnInterval` on both): sled is 9–30x faster on small writes and 2x on
+reads, and flat across read/write mixes. The whole gap is syscalls. Every
+Bitcask `set` is a `write(2)` on a raw `File` under the writer mutex, every
+`get` is a `pread(2)`; sled's hot path never enters the kernel (writes go to
+a user-space log buffer flushed by a background thread, reads hit its own
+page cache). Sled's durability window is the same interval ours is, so the
+speed is not bought with weaker guarantees. The one cell we win is 16 KiB
+writes, where a sequential append beats sled re-serializing a leaf node.
+
+- [ ] Buffer the active file: `BufWriter` (or our own buffer) instead of a
+  `write_all` per `set`, flushed on the durability timer and before any read
+  of the active file. Removes the per-put syscall under `OsDecides` /
+  `SyncOnInterval`. Cost: a process crash (not just power loss) now loses the
+  buffer, which is what those policies already promise.
+- [ ] Group commit for `SyncOnEveryPut` (the RocksDB / Riak trick). Writers
+  push their record onto a queue and contend for the writer mutex; whoever
+  wins is the leader, drains the queue into one `write_all` + one fsync,
+  then wakes the followers. Batch size adapts to load: one writer degrades
+  to exactly today's path, N concurrent writers share one fsync. No
+  separate WAL needed — the data file *is* the log, so the batch goes
+  straight into it. Ordering invariant to keep: fsync **before** the index
+  updates, so a reader can never see a value a crash would lose (same rule
+  as RocksDB: WAL append, sync, then memtable).
+- [ ] Measure both against `benches/engines.rs` and under server load with
+  concurrent clients (the only place group commit shows up). Decide with
+  numbers whether the read side also wants a small hot-value cache to skip
+  `pread` on the working set — that is the other half of sled's advantage,
+  and unlike the write side it only pays off while the working set fits.
 
 ## Phase 12 — Second engine: LSM tree (new repo)
 
