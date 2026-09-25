@@ -1,4 +1,5 @@
 use super::policy::DurabilityPolicy;
+use crate::StoreType;
 use std::path::PathBuf;
 
 const COMPACTION_THRESHOLD: u64 = 1 << 20; // 1 MB
@@ -11,16 +12,18 @@ pub struct Config {
     pub file_size_threshold: u64,
     pub compaction_threshold: u64,
     pub flush_threshold_millis: u64,
+    pub store_type: StoreType,
 }
 
 impl Config {
-    pub fn new(dir: impl Into<PathBuf>) -> Self {
+    pub fn new(dir: impl Into<PathBuf>, store_type: StoreType) -> Self {
         Config {
             dir: dir.into(),
             durability_policy: DurabilityPolicy::OsDecides,
             file_size_threshold: FILE_SIZE_THRESHOLD,
             compaction_threshold: COMPACTION_THRESHOLD,
             flush_threshold_millis: FLUSH_THRESHOLD_MILLIS,
+            store_type,
         }
     }
 }

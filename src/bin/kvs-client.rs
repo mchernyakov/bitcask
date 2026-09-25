@@ -1,9 +1,9 @@
 use clap::Parser;
-use kvs::network::{decode_response, read_frame, write_request, Request, Response};
 use kvs::Result;
+use kvs::network::{Request, Response, decode_response, read_frame, write_request};
 use kvs::{KvsError, ReplCommand};
-use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 use std::io;
 use std::net::{SocketAddr, TcpStream};
 

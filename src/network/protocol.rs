@@ -166,7 +166,11 @@ mod tests {
 
         let mut cursor = Cursor::new(&wire);
         let (msg_type, payload) = read_frame(&mut cursor).unwrap().unwrap();
-        assert_eq!(cursor.position() as usize, wire.len(), "frame not fully consumed");
+        assert_eq!(
+            cursor.position() as usize,
+            wire.len(),
+            "frame not fully consumed"
+        );
         assert_eq!(&decode_request(msg_type, &payload).unwrap(), req);
     }
 
@@ -176,7 +180,11 @@ mod tests {
 
         let mut cursor = Cursor::new(&wire);
         let (msg_type, payload) = read_frame(&mut cursor).unwrap().unwrap();
-        assert_eq!(cursor.position() as usize, wire.len(), "frame not fully consumed");
+        assert_eq!(
+            cursor.position() as usize,
+            wire.len(),
+            "frame not fully consumed"
+        );
         assert_eq!(&decode_response(msg_type, &payload).unwrap(), resp);
     }
 
@@ -235,9 +243,15 @@ mod tests {
         wire.extend_from_slice(&frame(3, b"third"));
 
         let mut cursor = Cursor::new(wire);
-        assert_eq!(read_frame(&mut cursor).unwrap(), Some((1, b"first".to_vec())));
+        assert_eq!(
+            read_frame(&mut cursor).unwrap(),
+            Some((1, b"first".to_vec()))
+        );
         assert_eq!(read_frame(&mut cursor).unwrap(), Some((2, Vec::new())));
-        assert_eq!(read_frame(&mut cursor).unwrap(), Some((3, b"third".to_vec())));
+        assert_eq!(
+            read_frame(&mut cursor).unwrap(),
+            Some((3, b"third".to_vec()))
+        );
         assert_eq!(read_frame(&mut cursor).unwrap(), None);
     }
 

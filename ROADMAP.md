@@ -116,9 +116,15 @@ is why project 4 demands that signature.
   the framing and partial-read handling *is* the lesson.
 - [x] Typed errors across the wire: a server-side `KvsError` arrives at the
   client as a typed error, not a string.
-- [ ] `KvsEngine` trait with a second implementation (`sled`) behind it;
+- [x] `KvStore` trait with a second implementation (`sled`) behind it;
   criterion benchmark ours vs. sled at several value sizes and read/write
-  mixes. Reading sled's docs to understand *why* it differs is half the value.
+  mixes (`benches/engines.rs`). Engine is picked at runtime via
+  `Config::store_type` / `--store-type`, dispatched through the `Store` enum
+  (static dispatch over a closed set, no `dyn`). The lock file carries an
+  engine marker so a directory can't be opened by the wrong engine.
+- [ ] Run the engine benchmark and write down *why* sled differs (its page
+  cache, `insert` returning the old value, flush cadence vs. our durability
+  policies). Reading sled's docs for this is half the value of the item above.
 - [ ] Stretch with a big payoff: speak a subset of RESP instead of (or beside)
   the custom protocol, so `redis-cli` and `redis-benchmark` work against the
   store for free — instant load-testing tooling.

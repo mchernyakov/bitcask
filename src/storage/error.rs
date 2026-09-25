@@ -39,6 +39,8 @@ pub enum KvsError {
     /// The server failed for a reason it doesn't expose (I/O, corruption, ...) -- produced only on the client side error.
     #[error("Internal server error")]
     ServerInternal,
+    #[error("Store directory belongs to the '{found}' engine, not '{requested}'")]
+    EngineMismatch { found: String, requested: String },
 }
 
 /// Result type for kvs.

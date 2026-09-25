@@ -1,21 +1,34 @@
-use kvs::Bitcask;
+use clap::Parser;
 use kvs::Config;
 use kvs::KvStore;
 use kvs::ReplCommand;
-use rustyline::error::ReadlineError;
+use kvs::{Store, StoreType};
 use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
+
+#[derive(Parser)]
+#[command(name = "kvs-repl", about = "Bitcask key/value REPL")]
+struct Args {
+    #[arg(long, default_value = "kvs/")]
+    dir: String,
+
+    #[arg(long, value_enum, default_value_t = StoreType::Bitcask)]
+    store_type: StoreType,
+}
 
 fn main() {
     kvs::log::configure_logger();
+
+    let args = Args::parse();
 
     let mut rl = DefaultEditor::new().unwrap();
 
     kvs::print_help();
 
-    let kvstore = match Bitcask::open(Config::new("kvs/")) {
+    let kvstore = match Store::open(Config::new(&args.dir, args.store_type)) {
         Ok(store) => store,
         Err(err) => {
-            eprintln!("Error opening KvStore (Bitcask): {}", err);
+            eprintln!("Error opening KvStore: {}", err);
             return;
         }
     };

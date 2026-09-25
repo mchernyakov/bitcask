@@ -1,13 +1,13 @@
 use super::command::Command;
 use super::config::Config;
-use super::index::Index;
 use super::index::INDEX_BUCKETS_NUM;
+use super::index::Index;
 use super::index_value::IndexValue;
 use super::kvstore::KvStore;
 use super::lock_file::LockFile;
 use super::policy::DurabilityPolicy;
 use super::record_reader::{RecordRead, RecordReader};
-use crate::{KvsError, Result};
+use crate::{KvsError, Result, StoreType};
 use arc_swap::ArcSwap;
 use log::{debug, trace};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -15,13 +15,11 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
-use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs, thread};
-
-const LOCK_FILE_NAME: &str = "bitcask.lock";
 
 fn unix_now() -> Result<Duration> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?)
@@ -591,8 +589,7 @@ impl KvStore for Bitcask {
 
         fs::create_dir_all(dir_path)?;
 
-        let lock_file_path = dir_path.join(LOCK_FILE_NAME);
-        let lock_file = LockFile::acquire(lock_file_path)?;
+        let lock_file = LockFile::acquire(dir_path, StoreType::Bitcask)?;
 
         let mut read_handlers: BTreeMap<u64, Arc<File>> = BTreeMap::new();
         let mut max_id: Option<u64> = None;
@@ -794,6 +791,7 @@ fn get_file_id(file_name: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::StoreType;
     use tempfile::tempdir;
 
     #[test_log::test]
@@ -822,7 +820,7 @@ mod tests {
         file.flush()?;
         drop(file);
 
-        let bitcask = Bitcask::open(Config::new(dir.path()))?;
+        let bitcask = Bitcask::open(Config::new(dir.path(), StoreType::Bitcask))?;
 
         assert_eq!(bitcask.get("alpha")?, Some("beta".to_owned()));
         assert_eq!(fs::metadata(&log_path)?.len(), valid.len() as u64);
@@ -863,7 +861,7 @@ mod tests {
         .serialize(b"zeta");
         fs::write(dir.path().join("000001.hint"), &hint)?;
 
-        let bitcask = Bitcask::open(Config::new(dir.path()))?;
+        let bitcask = Bitcask::open(Config::new(dir.path(), StoreType::Bitcask))?;
 
         assert_eq!(bitcask.get("zeta")?, Some("beta".to_owned()));
         assert_eq!(bitcask.get("alpha")?, None);
@@ -910,7 +908,7 @@ mod tests {
         .serialize();
         fs::write(dir.path().join("000003.data"), &active)?;
 
-        let bitcask = Bitcask::open(Config::new(dir.path()))?;
+        let bitcask = Bitcask::open(Config::new(dir.path(), StoreType::Bitcask))?;
 
         assert_eq!(bitcask.get("k")?, Some("new".to_owned()));
         assert_eq!(bitcask.get("other")?, Some("x".to_owned()));
@@ -950,12 +948,12 @@ mod tests {
         .serialize(b"b");
         fs::write(dir.path().join("000002.hint"), &hint)?;
 
-        let bitcask = Bitcask::open(Config::new(dir.path()))?;
+        let bitcask = Bitcask::open(Config::new(dir.path(), StoreType::Bitcask))?;
         bitcask.set("c", "3")?;
         assert_eq!(bitcask.get("c")?, Some("3".to_owned()));
         drop(bitcask);
 
-        let bitcask = Bitcask::open(Config::new(dir.path()))?;
+        let bitcask = Bitcask::open(Config::new(dir.path(), StoreType::Bitcask))?;
         assert_eq!(bitcask.get("a")?, Some("1".to_owned()));
         assert_eq!(bitcask.get("b")?, Some("2".to_owned()));
         assert_eq!(bitcask.get("c")?, Some("3".to_owned()));
@@ -993,7 +991,7 @@ mod tests {
         hint.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
         fs::write(dir.path().join("000001.hint"), &hint)?;
 
-        let bitcask = Bitcask::open(Config::new(dir.path()))?;
+        let bitcask = Bitcask::open(Config::new(dir.path(), StoreType::Bitcask))?;
 
         assert_eq!(bitcask.get("alpha")?, Some("beta".to_owned()));
         assert_eq!(bitcask.get("gamma")?, Some("delta".to_owned()));
@@ -1039,7 +1037,7 @@ mod tests {
         fs::write(dir.path().join("000005.hint"), b"half-written hint")?;
         fs::write(dir.path().join("000010.data"), b"")?;
 
-        let bitcask = Bitcask::open(Config::new(dir.path()))?;
+        let bitcask = Bitcask::open(Config::new(dir.path(), StoreType::Bitcask))?;
 
         assert_eq!(bitcask.get("k1")?, Some("a".to_owned()));
         assert_eq!(bitcask.get("k2")?, Some("b".to_owned()));
@@ -1055,7 +1053,7 @@ mod tests {
         // store stays usable across another cycle
         bitcask.set("k3", "c")?;
         drop(bitcask);
-        let bitcask = Bitcask::open(Config::new(dir.path()))?;
+        let bitcask = Bitcask::open(Config::new(dir.path(), StoreType::Bitcask))?;
         assert_eq!(bitcask.get("k1")?, Some("a".to_owned()));
         assert_eq!(bitcask.get("k3")?, Some("c".to_owned()));
 
@@ -1138,7 +1136,7 @@ mod tests {
 
         merged_output(dir.path())?;
 
-        let bitcask = Bitcask::open(Config::new(dir.path()))?;
+        let bitcask = Bitcask::open(Config::new(dir.path(), StoreType::Bitcask))?;
 
         assert_eq!(
             bitcask.get("k")?,
@@ -1167,7 +1165,7 @@ mod tests {
 
         merged_output(dir.path())?;
 
-        let bitcask = Bitcask::open(Config::new(dir.path()))?;
+        let bitcask = Bitcask::open(Config::new(dir.path(), StoreType::Bitcask))?;
 
         assert_eq!(bitcask.get("k")?, Some("new".to_owned()));
         assert_eq!(bitcask.get("k2")?, Some("x".to_owned()));

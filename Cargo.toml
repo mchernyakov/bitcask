@@ -27,6 +27,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 log = "0.4.34"
 arc-swap = "1.9.2"
+sled = "0.34.7"
 
 [dev-dependencies]
 tempfile = "3.0.7"
@@ -36,4 +37,8 @@ criterion = "0.8.2"
 
 [[bench]]
 name = "bitcask"
+harness = false
+
+[[bench]]
+name = "engines"
 harness = false

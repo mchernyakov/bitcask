@@ -9,8 +9,8 @@
 //! Criterion runs release builds, warms up, and reports the delta per
 //! benchmark with a significance verdict.
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use kvs::{Bitcask, Config, DurabilityPolicy, KvStore};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use kvs::{Bitcask, Config, DurabilityPolicy, KvStore, StoreType};
 use std::fs;
 use std::hint::black_box;
 use std::path::Path;
@@ -29,7 +29,7 @@ fn write_config(dir: &Path, policy: DurabilityPolicy) -> Config {
         durability_policy: policy,
         file_size_threshold: 4 << 20,
         compaction_threshold: u64::MAX,
-        ..Config::new(dir)
+        ..Config::new(dir, StoreType::Bitcask)
     }
 }
 
@@ -75,7 +75,7 @@ fn bench_get(c: &mut Criterion) {
     let store = Bitcask::open(Config {
         file_size_threshold: 64 << 10,
         compaction_threshold: u64::MAX,
-        ..Config::new(dir.path())
+        ..Config::new(dir.path(), StoreType::Bitcask)
     })
     .unwrap();
     for i in 0..10_000 {
@@ -106,7 +106,7 @@ fn prepare_startup_dirs() -> (TempDir, TempDir) {
         let store = Bitcask::open(Config {
             file_size_threshold: 64 << 10,
             compaction_threshold: 128 << 10,
-            ..Config::new(with_hints.path())
+            ..Config::new(with_hints.path(), StoreType::Bitcask)
         })
         .unwrap();
         // two passes: the first pass goes stale, merges fire and write hints
@@ -142,10 +142,14 @@ fn bench_open(c: &mut Criterion) {
     let mut group = c.benchmark_group("open");
     group.sample_size(20);
     group.bench_function("replay_from_hints", |b| {
-        b.iter(|| black_box(Bitcask::open(Config::new(with_hints.path())).unwrap()))
+        b.iter(|| {
+            black_box(Bitcask::open(Config::new(with_hints.path(), StoreType::Bitcask)).unwrap())
+        })
     });
     group.bench_function("replay_from_data", |b| {
-        b.iter(|| black_box(Bitcask::open(Config::new(without_hints.path())).unwrap()))
+        b.iter(|| {
+            black_box(Bitcask::open(Config::new(without_hints.path(), StoreType::Bitcask)).unwrap())
+        })
     });
     group.finish();
 }
@@ -163,7 +167,7 @@ fn bench_get_concurrent(c: &mut Criterion) {
     let store = Bitcask::open(Config {
         file_size_threshold: 64 << 10,
         compaction_threshold: u64::MAX,
-        ..Config::new(dir.path())
+        ..Config::new(dir.path(), StoreType::Bitcask)
     })
     .unwrap();
     for i in 0..10_000 {

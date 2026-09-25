@@ -1,7 +1,7 @@
 use clap::Parser;
-use kvs::network::{decode_request, execute, read_frame, write_response, ErrorCode, Response};
-use kvs::Result;
-use kvs::{Bitcask, Config, KvStore};
+use kvs::network::{ErrorCode, Response, decode_request, execute, read_frame, write_response};
+use kvs::{Config, KvStore};
+use kvs::{Result, Store, StoreType};
 use log::{error, info};
 use std::io::{BufReader, BufWriter};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -14,17 +14,22 @@ struct Args {
 
     #[arg(long, default_value = "kvs/")]
     dir: String,
+
+    #[arg(long, value_enum, default_value_t = StoreType::Bitcask)]
+    store_type: StoreType,
 }
 
 fn main() -> kvs::Result<()> {
     kvs::log::configure_logger();
 
     let args = Args::parse();
-    let store = Bitcask::open(Config::new(&args.dir))?;
+
+    let store = Store::open(Config::new(&args.dir, args.store_type))?;
+
     let listener = TcpListener::bind(args.addr)?;
     info!(
-        "start server: kvs-server --addr {} --dir {}",
-        args.addr, args.dir
+        "start server: kvs-server --addr {} --dir {} --store-type {:?}",
+        args.addr, args.dir, args.store_type
     );
 
     for stream in listener.incoming() {

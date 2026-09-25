@@ -3,14 +3,59 @@
 //! tests for durability policies, rotation, compaction, and hint files.
 //!
 //! Adaptations to this implementation:
-//! - The store is `Bitcask` (implementing the `KvStore` trait), opened with a
-//!   `Config`, and the API takes `&str` instead of `String`.
+//! - Two engines implement `KvStore`: our `Bitcask` and a `sled` wrapper.
+//!   Tests that only exercise the trait contract take a `StoreType`, open the
+//!   engine through `Store`, and are stamped out once per engine by
+//!   `engine_tests!` (as `bitcask::<name>` and `sled::<name>`). Tests that
+//!   poke at Bitcask internals (files, hints, compaction) use `Bitcask`
+//!   directly.
+//! - The store is opened with a `Config`, and the API takes `&str` instead of
+//!   `String`.
 //! - The original CLI tests were dropped: the `kvs` binary is an interactive
 //!   REPL, not the batch CLI the upstream suite drives.
 
-use kvs::{Bitcask, Config, DurabilityPolicy, KvStore, KvsError, Result};
+use kvs::{Bitcask, Config, DurabilityPolicy, KvStore, KvsError, Result, Store, StoreType};
 use tempfile::TempDir;
 use walkdir::WalkDir;
+
+macro_rules! engine_tests {
+    ($($name:ident),* $(,)?) => {
+        mod bitcask {
+            $(
+                #[test_log::test]
+                fn $name() -> super::Result<()> {
+                    super::$name(super::StoreType::Bitcask)
+                }
+            )*
+        }
+        mod sled {
+            $(
+                #[test_log::test]
+                fn $name() -> super::Result<()> {
+                    super::$name(super::StoreType::Sled)
+                }
+            )*
+        }
+    };
+}
+
+engine_tests!(
+    set_then_get_with_sync_on_every_put,
+    set_then_get_with_sync_on_interval,
+    get_stored_value,
+    overwrite_value,
+    get_non_existent_value,
+    remove_non_existent_key,
+    removed_key_stays_removed_after_reopen,
+    record_larger_than_file_threshold_roundtrips,
+    empty_key_and_empty_value_roundtrip,
+    random_ops_match_in_memory_model,
+    concurrent_readers_with_one_writer,
+    concurrent_writers_do_not_lose_writes,
+    clone_shares_state_and_dropping_one_handle_is_harmless,
+    second_open_fails_while_store_is_locked,
+    directory_created_by_other_engine_is_refused,
+);
 
 fn filler_value() -> String {
     "v".repeat(32)
@@ -39,33 +84,33 @@ fn assert_filler_pass(store: &Bitcask, context: &str) -> Result<()> {
     Ok(())
 }
 
-#[test_log::test]
-fn set_then_get_with_sync_on_every_put() -> Result<()> {
+// ---------------------------------------------------------------------------
+// Engine-agnostic: the KvStore contract, run against every engine.
+// ---------------------------------------------------------------------------
+
+fn set_then_get_with_sync_on_every_put(store_type: StoreType) -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    let store = Bitcask::open(Config {
+    let config = || Config {
         durability_policy: DurabilityPolicy::SyncOnEveryPut,
-        ..Config::new(temp_dir.path())
-    })?;
+        ..Config::new(temp_dir.path(), store_type)
+    };
+    let store = Store::open(config())?;
 
     store.set("key1", "value1")?;
     assert_eq!(store.get("key1")?, Some("value1".to_owned()));
 
     drop(store);
-    let store = Bitcask::open(Config {
-        durability_policy: DurabilityPolicy::SyncOnEveryPut,
-        ..Config::new(temp_dir.path())
-    })?;
+    let store = Store::open(config())?;
     assert_eq!(store.get("key1")?, Some("value1".to_owned()));
 
     Ok(())
 }
 
-#[test_log::test]
-fn set_then_get_with_sync_on_interval() -> Result<()> {
+fn set_then_get_with_sync_on_interval(store_type: StoreType) -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    let store = Bitcask::open(Config {
+    let store = Store::open(Config {
         durability_policy: DurabilityPolicy::SyncOnInterval,
-        ..Config::new(temp_dir.path())
+        ..Config::new(temp_dir.path(), store_type)
     })?;
 
     store.set("key1", "value1")?;
@@ -80,10 +125,9 @@ fn set_then_get_with_sync_on_interval() -> Result<()> {
 }
 
 // Should get previously stored value.
-#[test_log::test]
-fn get_stored_value() -> Result<()> {
+fn get_stored_value(store_type: StoreType) -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    let store = Bitcask::open(Config::new(temp_dir.path()))?;
+    let store = Store::open(Config::new(temp_dir.path(), store_type))?;
 
     store.set("key1", "value1")?;
     store.set("key2", "value2")?;
@@ -93,7 +137,7 @@ fn get_stored_value() -> Result<()> {
 
     // Open from disk again and check persistent data.
     drop(store);
-    let store = Bitcask::open(Config::new(temp_dir.path()))?;
+    let store = Store::open(Config::new(temp_dir.path(), store_type))?;
     assert_eq!(store.get("key1")?, Some("value1".to_owned()));
     assert_eq!(store.get("key2")?, Some("value2".to_owned()));
 
@@ -101,10 +145,9 @@ fn get_stored_value() -> Result<()> {
 }
 
 // Should overwrite existent value.
-#[test_log::test]
-fn overwrite_value() -> Result<()> {
+fn overwrite_value(store_type: StoreType) -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    let store = Bitcask::open(Config::new(temp_dir.path()))?;
+    let store = Store::open(Config::new(temp_dir.path(), store_type))?;
 
     store.set("key1", "value1")?;
     assert_eq!(store.get("key1")?, Some("value1".to_owned()));
@@ -113,7 +156,7 @@ fn overwrite_value() -> Result<()> {
 
     // Open from disk again and check persistent data.
     drop(store);
-    let store = Bitcask::open(Config::new(temp_dir.path()))?;
+    let store = Store::open(Config::new(temp_dir.path(), store_type))?;
     assert_eq!(store.get("key1")?, Some("value2".to_owned()));
     store.set("key1", "value3")?;
     assert_eq!(store.get("key1")?, Some("value3".to_owned()));
@@ -122,34 +165,33 @@ fn overwrite_value() -> Result<()> {
 }
 
 // Should get `None` when getting a non-existent key.
-#[test_log::test]
-fn get_non_existent_value() -> Result<()> {
+fn get_non_existent_value(store_type: StoreType) -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    let store = Bitcask::open(Config::new(temp_dir.path()))?;
+    let store = Store::open(Config::new(temp_dir.path(), store_type))?;
 
     store.set("key1", "value1")?;
     assert_eq!(store.get("key2")?, None);
 
     // Open from disk again and check persistent data.
     drop(store);
-    let store = Bitcask::open(Config::new(temp_dir.path()))?;
+    let store = Store::open(Config::new(temp_dir.path(), store_type))?;
     assert_eq!(store.get("key2")?, None);
 
     Ok(())
 }
 
-#[test_log::test]
-fn remove_non_existent_key() -> Result<()> {
+// Every engine must report a missing key the same way, so the server can map
+// it to one wire error.
+fn remove_non_existent_key(store_type: StoreType) -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    let store = Bitcask::open(Config::new(temp_dir.path()))?;
-    assert!(store.remove("key1").is_err());
+    let store = Store::open(Config::new(temp_dir.path(), store_type))?;
+    assert!(matches!(store.remove("key1"), Err(KvsError::KeyNotFound)));
     Ok(())
 }
 
-#[test_log::test]
-fn removed_key_stays_removed_after_reopen() -> Result<()> {
+fn removed_key_stays_removed_after_reopen(store_type: StoreType) -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    let store = Bitcask::open(Config::new(temp_dir.path()))?;
+    let store = Store::open(Config::new(temp_dir.path(), store_type))?;
 
     store.set("key1", "value1")?;
     store.set("key2", "value2")?;
@@ -157,50 +199,22 @@ fn removed_key_stays_removed_after_reopen() -> Result<()> {
     assert_eq!(store.get("key1")?, None);
 
     drop(store);
-    let store = Bitcask::open(Config::new(temp_dir.path()))?;
+    let store = Store::open(Config::new(temp_dir.path(), store_type))?;
     assert_eq!(store.get("key1")?, None);
     assert_eq!(store.get("key2")?, Some("value2".to_owned()));
 
     Ok(())
 }
 
-// A removed key whose Set record still sits in a sealed file must not be
-// resurrected by the merge dropping its tombstone.
-#[test_log::test]
-fn remove_then_compaction_does_not_resurrect() -> Result<()> {
-    let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    let config = || Config {
-        file_size_threshold: 2048,
-        compaction_threshold: 2048,
-        ..Config::new(temp_dir.path())
-    };
-    let store = Bitcask::open(config())?;
-
-    store.set("victim", "resurrect-me-not")?;
-
-    write_filler_pass(&store)?;
-    store.remove("victim")?;
-    write_filler_pass(&store)?;
-
-    assert_eq!(store.get("victim")?, None);
-
-    drop(store);
-    let store = Bitcask::open(config())?;
-    assert_eq!(store.get("victim")?, None);
-    assert_eq!(store.get("filler0")?, Some(filler_value()));
-
-    Ok(())
-}
-
-// A single record may legally exceed the rotation threshold.
-#[test_log::test]
-fn record_larger_than_file_threshold_roundtrips() -> Result<()> {
+// A single record may legally exceed the rotation threshold. (Sled has no
+// such threshold; for it this is just a large-value roundtrip.)
+fn record_larger_than_file_threshold_roundtrips(store_type: StoreType) -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
     let config = || Config {
         file_size_threshold: 1024,
-        ..Config::new(temp_dir.path())
+        ..Config::new(temp_dir.path(), store_type)
     };
-    let store = Bitcask::open(config())?;
+    let store = Store::open(config())?;
 
     let big = "x".repeat(4096);
     store.set("big", &big)?;
@@ -209,17 +223,16 @@ fn record_larger_than_file_threshold_roundtrips() -> Result<()> {
     assert_eq!(store.get("small")?, Some("y".to_owned()));
 
     drop(store);
-    let store = Bitcask::open(config())?;
+    let store = Store::open(config())?;
     assert_eq!(store.get("big")?, Some(big));
     assert_eq!(store.get("small")?, Some("y".to_owned()));
 
     Ok(())
 }
 
-#[test_log::test]
-fn empty_key_and_empty_value_roundtrip() -> Result<()> {
+fn empty_key_and_empty_value_roundtrip(store_type: StoreType) -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    let store = Bitcask::open(Config::new(temp_dir.path()))?;
+    let store = Store::open(Config::new(temp_dir.path(), store_type))?;
 
     store.set("", "empty-key")?;
     store.set("k", "")?;
@@ -227,7 +240,7 @@ fn empty_key_and_empty_value_roundtrip() -> Result<()> {
     assert_eq!(store.get("k")?, Some("".to_owned()));
 
     drop(store);
-    let store = Bitcask::open(Config::new(temp_dir.path()))?;
+    let store = Store::open(Config::new(temp_dir.path(), store_type))?;
     assert_eq!(store.get("")?, Some("empty-key".to_owned()));
     assert_eq!(store.get("k")?, Some("".to_owned()));
     store.remove("")?;
@@ -239,8 +252,7 @@ fn empty_key_and_empty_value_roundtrip() -> Result<()> {
 // Random ops against an in-memory oracle, with thresholds small enough that
 // rotation, compaction, and hint files all fire organically, and periodic
 // reopens to exercise replay and hint loading. Deterministic seed.
-#[test_log::test]
-fn random_ops_match_in_memory_model() -> Result<()> {
+fn random_ops_match_in_memory_model(store_type: StoreType) -> Result<()> {
     struct Rng(u64);
     impl Rng {
         fn next(&mut self) -> u64 {
@@ -257,10 +269,10 @@ fn random_ops_match_in_memory_model() -> Result<()> {
     let config = || Config {
         file_size_threshold: 2048,
         compaction_threshold: 2048,
-        ..Config::new(temp_dir.path())
+        ..Config::new(temp_dir.path(), store_type)
     };
 
-    let mut store = Bitcask::open(config())?;
+    let mut store = Store::open(config())?;
     let mut model: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut rng = Rng(0xDEAD_BEEF);
 
@@ -292,7 +304,7 @@ fn random_ops_match_in_memory_model() -> Result<()> {
 
         if step % 1000 == 999 {
             drop(store);
-            store = Bitcask::open(config())?;
+            store = Store::open(config())?;
             for (k, v) in &model {
                 assert_eq!(
                     store.get(k)?.as_deref(),
@@ -306,221 +318,15 @@ fn random_ops_match_in_memory_model() -> Result<()> {
     Ok(())
 }
 
-// Writing more than one file's worth of data must roll over into new data
-// files, and every value must survive a reopen from the multi-file state.
-#[test_log::test]
-fn rotation_splits_log_into_multiple_files() -> Result<()> {
-    let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    let store = Bitcask::open(Config {
-        file_size_threshold: 4096,
-        ..Config::new(temp_dir.path())
-    })?;
-
-    let value = "v".repeat(64);
-    for i in 0..200 {
-        store.set(&format!("key{}", i), &value)?;
-    }
-    drop(store);
-
-    let data_files = std::fs::read_dir(temp_dir.path())?
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .map(|n| n.len() == "000001.data".len() && n.ends_with(".data"))
-                .unwrap_or(false)
-        })
-        .count();
-    assert!(
-        data_files >= 2,
-        "expected rotation to create multiple .data files, found {data_files}"
-    );
-
-    let store = Bitcask::open(Config::new(temp_dir.path()))?;
-    for i in 0..200 {
-        let key = format!("key{}", i);
-        assert_eq!(
-            store.get(&key)?,
-            Some(value.clone()),
-            "lost {key} after reopen"
-        );
-    }
-
-    Ok(())
-}
-
-// A key merged into a compaction output (id above the active file) and then
-// overwritten in the still-active file must keep the NEW value across reopen:
-// replay is later-id-wins, so the active writer has to rotate above the
-// compaction outputs before accepting further writes.
-#[test_log::test]
-fn overwrite_after_compaction_survives_reopen() -> Result<()> {
-    let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    let store = Bitcask::open(Config {
-        file_size_threshold: 2048,
-        compaction_threshold: 2048,
-        ..Config::new(temp_dir.path())
-    })?;
-
-    store.set("k1", "old")?;
-
-    // First pass seals k1 into an old file; second pass makes the first pass
-    // stale and pushes past the compaction threshold, so k1 (still live, still
-    // in the old file) gets merged into a compaction output.
-    write_filler_pass(&store)?;
-    write_filler_pass(&store)?;
-
-    store.set("k1", "new")?;
-    assert_eq!(store.get("k1")?, Some("new".to_owned()));
-
-    drop(store);
-    let store = Bitcask::open(Config::new(temp_dir.path()))?;
-    assert_eq!(store.get("k1")?, Some("new".to_owned()));
-    assert_eq!(store.get("filler0")?, Some(filler_value()));
-
-    Ok(())
-}
-
-// Every compaction output gets a sibling hint file (000004.data -> 000004.hint)
-// describing its records, and no hint file may outlive its data file.
-#[test_log::test]
-fn merge_writes_hint_files_next_to_outputs() -> Result<()> {
-    let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    let store = Bitcask::open(Config {
-        file_size_threshold: 2048,
-        compaction_threshold: 2048,
-        ..Config::new(temp_dir.path())
-    })?;
-
-    write_filler_pass(&store)?;
-    write_filler_pass(&store)?;
-    drop(store);
-
-    let mut hint_files = 0;
-    let mut non_empty_hint_files = 0;
-    for entry in std::fs::read_dir(temp_dir.path())? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if let Some(stem) = name.strip_suffix(".hint") {
-            hint_files += 1;
-            if entry.metadata()?.len() > 0 {
-                non_empty_hint_files += 1;
-            }
-            let data_sibling = temp_dir.path().join(format!("{stem}.data"));
-            assert!(
-                data_sibling.exists(),
-                "hint file {name} has no data file sibling"
-            );
-        }
-    }
-    assert!(hint_files >= 1, "merge should write at least one hint file");
-    assert!(
-        non_empty_hint_files >= 1,
-        "at least one hint file should describe live records"
-    );
-
-    Ok(())
-}
-
-// Hint files are a startup optimization: damaged or orphaned ones must never
-// brick open() or corrupt the recovered data.
-#[test_log::test]
-fn open_survives_corrupt_and_orphan_hint_files() -> Result<()> {
-    let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-
-    let config = || Config {
-        file_size_threshold: 2048,
-        compaction_threshold: 2048,
-        ..Config::new(temp_dir.path())
-    };
-
-    let store = Bitcask::open(config())?;
-    write_filler_pass(&store)?;
-    write_filler_pass(&store)?;
-    drop(store);
-
-    // an orphan hint with no data file (e.g. crash between merge steps)
-    std::fs::write(temp_dir.path().join("000099.hint"), b"orphan")?;
-    // a foreign file that merely looks hint-like
-    std::fs::write(temp_dir.path().join("abc.hint"), b"not ours")?;
-
-    // every real hint file gets its content replaced with garbage
-    for entry in std::fs::read_dir(temp_dir.path())? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.ends_with(".hint") && name != "000099.hint" {
-            std::fs::write(entry.path(), b"this is not a hint record")?;
-        }
-    }
-
-    let store = Bitcask::open(config())?;
-    assert_filler_pass(&store, "after corrupting hints")?;
-
-    assert!(
-        !temp_dir.path().join("000099.hint").exists(),
-        "orphan hint with no data file should be removed on open"
-    );
-    assert!(
-        temp_dir.path().join("abc.hint").exists(),
-        "foreign .hint files must be kept"
-    );
-
-    Ok(())
-}
-
-// Loading the keydir from hints and rebuilding it by replay must agree, and
-// a successful hint load must not consume the hint files.
-#[test_log::test]
-fn reopen_from_hints_matches_replay_from_data() -> Result<()> {
-    let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    let config = || Config {
-        file_size_threshold: 2048,
-        compaction_threshold: 2048,
-        ..Config::new(temp_dir.path())
-    };
-
-    let store = Bitcask::open(config())?;
-    write_filler_pass(&store)?;
-    write_filler_pass(&store)?;
-    drop(store);
-
-    let hint_paths: Vec<std::path::PathBuf> = std::fs::read_dir(temp_dir.path())?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|ext| ext == "hint"))
-        .collect();
-    assert!(!hint_paths.is_empty(), "merge should have written hints");
-
-    // reopen #1: keydir comes from the hints
-    let store = Bitcask::open(config())?;
-    assert_filler_pass(&store, "hint path")?;
-    drop(store);
-
-    for path in &hint_paths {
-        assert!(
-            path.exists(),
-            "a successful hint load must not delete {path:?}"
-        );
-        std::fs::remove_file(path)?;
-    }
-
-    // reopen #2: keydir must come out identical from data replay alone
-    let store = Bitcask::open(config())?;
-    assert_filler_pass(&store, "replay path")?;
-
-    Ok(())
-}
-
-// Phase 5: one writer, many readers, constant merges. Reader threads hammer
-// get() over a small key space while the writer overwrites it with thresholds
+// Phase 5: one writer, many readers. Reader threads hammer get() over a small
+// key space while the writer overwrites it; for Bitcask the thresholds are
 // tiny enough that rotation and compaction fire constantly. A reader must only
 // ever see a well-formed value for the key it asked for (the per-record CRC
 // turns any torn read into an error, so a clean pass means no torn reads
 // either); a deadlock shows up as the test hanging. Rough ops/sec numbers are
 // printed as a baseline — run with --nocapture to see them; real benchmarks
-// are Phase 6 / criterion.
-#[test_log::test]
-fn concurrent_readers_with_one_writer_under_constant_merges() -> Result<()> {
+// are criterion.
+fn concurrent_readers_with_one_writer(store_type: StoreType) -> Result<()> {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -536,10 +342,10 @@ fn concurrent_readers_with_one_writer_under_constant_merges() -> Result<()> {
         .unwrap_or(5_000);
 
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    let store = Bitcask::open(Config {
+    let store = Store::open(Config {
         file_size_threshold: 2048,
         compaction_threshold: 2048,
-        ..Config::new(temp_dir.path())
+        ..Config::new(temp_dir.path(), store_type)
     })?;
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -609,7 +415,7 @@ fn concurrent_readers_with_one_writer_under_constant_merges() -> Result<()> {
     let reads = read_ops.load(Ordering::Relaxed);
     assert!(reads > 0, "readers never got to run");
     eprintln!(
-        "stress: {writes} writes, {reads} reads across {READERS} readers in {elapsed:.2?} \
+        "stress ({store_type:?}): {writes} writes, {reads} reads across {READERS} readers in {elapsed:.2?} \
          ({:.0} writes/s, {:.0} reads/s)",
         writes as f64 / elapsed.as_secs_f64(),
         reads as f64 / elapsed.as_secs_f64(),
@@ -620,7 +426,7 @@ fn concurrent_readers_with_one_writer_under_constant_merges() -> Result<()> {
         assert_eq!(store.get(key)?.as_deref(), Some(value.as_str()));
     }
     drop(store);
-    let store = Bitcask::open(Config::new(temp_dir.path()))?;
+    let store = Store::open(Config::new(temp_dir.path(), store_type))?;
     for k in 0..KEYS {
         let key = format!("key{k}");
         assert_eq!(
@@ -634,21 +440,20 @@ fn concurrent_readers_with_one_writer_under_constant_merges() -> Result<()> {
 }
 
 // The trait contract (Clone + Send + &self) allows several threads to write
-// through their own handles; the writer mutex must serialize them without
-// losing a single write, across rotations and merges triggered from any
-// thread. Two passes per writer so the first pass goes stale and merges fire.
-#[test_log::test]
-fn concurrent_writers_do_not_lose_writes() -> Result<()> {
+// through their own handles; the engine must serialize them without losing a
+// single write, across rotations and merges triggered from any thread. Two
+// passes per writer so the first pass goes stale and merges fire.
+fn concurrent_writers_do_not_lose_writes(store_type: StoreType) -> Result<()> {
     use std::thread;
 
     const WRITERS: u64 = 4;
     const KEYS_PER_WRITER: u64 = 300;
 
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    let store = Bitcask::open(Config {
+    let store = Store::open(Config {
         file_size_threshold: 2048,
         compaction_threshold: 2048,
-        ..Config::new(temp_dir.path())
+        ..Config::new(temp_dir.path(), store_type)
     })?;
 
     let handles: Vec<_> = (0..WRITERS)
@@ -668,7 +473,7 @@ fn concurrent_writers_do_not_lose_writes() -> Result<()> {
         handle.join().expect("writer thread panicked")?;
     }
 
-    let check = |store: &Bitcask| -> Result<()> {
+    let check = |store: &Store| -> Result<()> {
         for w in 0..WRITERS {
             for i in 0..KEYS_PER_WRITER {
                 assert_eq!(
@@ -683,7 +488,7 @@ fn concurrent_writers_do_not_lose_writes() -> Result<()> {
     check(&store)?;
 
     drop(store);
-    let store = Bitcask::open(Config::new(temp_dir.path()))?;
+    let store = Store::open(Config::new(temp_dir.path(), store_type))?;
     check(&store)?;
 
     Ok(())
@@ -692,10 +497,9 @@ fn concurrent_writers_do_not_lose_writes() -> Result<()> {
 // Handles are cheap clones over shared state: writes through one handle are
 // visible through another, and dropping a handle (which runs the Drop sync)
 // must not disturb the survivors.
-#[test_log::test]
-fn clone_shares_state_and_dropping_one_handle_is_harmless() -> Result<()> {
+fn clone_shares_state_and_dropping_one_handle_is_harmless(store_type: StoreType) -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    let store = Bitcask::open(Config::new(temp_dir.path()))?;
+    let store = Store::open(Config::new(temp_dir.path(), store_type))?;
     let clone = store.clone();
 
     store.set("k1", "v1")?;
@@ -707,7 +511,7 @@ fn clone_shares_state_and_dropping_one_handle_is_harmless() -> Result<()> {
     assert_eq!(clone.get("k2")?, Some("v2".to_owned()));
 
     drop(clone);
-    let store = Bitcask::open(Config::new(temp_dir.path()))?;
+    let store = Store::open(Config::new(temp_dir.path(), store_type))?;
     assert_eq!(store.get("k1")?, Some("v1".to_owned()));
     assert_eq!(store.get("k2")?, Some("v2".to_owned()));
 
@@ -715,16 +519,16 @@ fn clone_shares_state_and_dropping_one_handle_is_harmless() -> Result<()> {
 }
 
 // Exactly one owner per store directory: open() takes an advisory file lock,
-// held as long as ANY handle lives, released when the last one drops.
-#[test_log::test]
-fn second_open_fails_while_store_is_locked() -> Result<()> {
+// held as long as ANY handle lives, released when the last one drops. Both
+// engines go through the same lock file, so both report `StoreLocked`.
+fn second_open_fails_while_store_is_locked(store_type: StoreType) -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    let store = Bitcask::open(Config::new(temp_dir.path()))?;
+    let store = Store::open(Config::new(temp_dir.path(), store_type))?;
     store.set("k", "v")?;
 
     assert!(
         matches!(
-            Bitcask::open(Config::new(temp_dir.path())),
+            Store::open(Config::new(temp_dir.path(), store_type)),
             Err(KvsError::StoreLocked)
         ),
         "second open on a live store must be refused"
@@ -735,7 +539,7 @@ fn second_open_fails_while_store_is_locked() -> Result<()> {
     drop(store);
     assert!(
         matches!(
-            Bitcask::open(Config::new(temp_dir.path())),
+            Store::open(Config::new(temp_dir.path(), store_type)),
             Err(KvsError::StoreLocked)
         ),
         "a clone still holds the lock"
@@ -743,8 +547,278 @@ fn second_open_fails_while_store_is_locked() -> Result<()> {
 
     // last handle gone -> lock released -> reopen succeeds
     drop(clone);
-    let store = Bitcask::open(Config::new(temp_dir.path()))?;
+    let store = Store::open(Config::new(temp_dir.path(), store_type))?;
     assert_eq!(store.get("k")?, Some("v".to_owned()));
+
+    Ok(())
+}
+
+// The lock file records which engine created the directory. Opening it with
+// the other engine must fail with `EngineMismatch` and leave the data alone,
+// so a wrong `--store-type` can't silently start an empty second store on
+// top of a full one.
+fn directory_created_by_other_engine_is_refused(store_type: StoreType) -> Result<()> {
+    let other = match store_type {
+        StoreType::Bitcask => StoreType::Sled,
+        StoreType::Sled => StoreType::Bitcask,
+    };
+
+    let temp_dir = TempDir::new().expect("unable to create temporary working directory");
+    let store = Store::open(Config::new(temp_dir.path(), store_type))?;
+    store.set("k", "v")?;
+    drop(store);
+
+    let err = Store::open(Config::new(temp_dir.path(), other))
+        .err()
+        .expect("opening with the other engine must fail");
+    match err {
+        KvsError::EngineMismatch { found, requested } => {
+            assert_eq!(found, store_type.as_str());
+            assert_eq!(requested, other.as_str());
+        }
+        other => panic!("expected EngineMismatch, got {other:?}"),
+    }
+
+    // the refusal must not have consumed the lock or touched the data
+    let store = Store::open(Config::new(temp_dir.path(), store_type))?;
+    assert_eq!(store.get("k")?, Some("v".to_owned()));
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Bitcask-specific: on-disk layout, rotation, compaction, hints.
+// ---------------------------------------------------------------------------
+
+// A removed key whose Set record still sits in a sealed file must not be
+// resurrected by the merge dropping its tombstone.
+#[test_log::test]
+fn remove_then_compaction_does_not_resurrect() -> Result<()> {
+    let temp_dir = TempDir::new().expect("unable to create temporary working directory");
+    let config = || Config {
+        file_size_threshold: 2048,
+        compaction_threshold: 2048,
+        ..Config::new(temp_dir.path(), StoreType::Bitcask)
+    };
+    let store = Bitcask::open(config())?;
+
+    store.set("victim", "resurrect-me-not")?;
+
+    write_filler_pass(&store)?;
+    store.remove("victim")?;
+    write_filler_pass(&store)?;
+
+    assert_eq!(store.get("victim")?, None);
+
+    drop(store);
+    let store = Bitcask::open(config())?;
+    assert_eq!(store.get("victim")?, None);
+    assert_eq!(store.get("filler0")?, Some(filler_value()));
+
+    Ok(())
+}
+
+// Writing more than one file's worth of data must roll over into new data
+// files, and every value must survive a reopen from the multi-file state.
+#[test_log::test]
+fn rotation_splits_log_into_multiple_files() -> Result<()> {
+    let temp_dir = TempDir::new().expect("unable to create temporary working directory");
+    let store = Bitcask::open(Config {
+        file_size_threshold: 4096,
+        ..Config::new(temp_dir.path(), StoreType::Bitcask)
+    })?;
+
+    let value = "v".repeat(64);
+    for i in 0..200 {
+        store.set(&format!("key{}", i), &value)?;
+    }
+    drop(store);
+
+    let data_files = std::fs::read_dir(temp_dir.path())?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .map(|n| n.len() == "000001.data".len() && n.ends_with(".data"))
+                .unwrap_or(false)
+        })
+        .count();
+    assert!(
+        data_files >= 2,
+        "expected rotation to create multiple .data files, found {data_files}"
+    );
+
+    let store = Bitcask::open(Config::new(temp_dir.path(), StoreType::Bitcask))?;
+    for i in 0..200 {
+        let key = format!("key{}", i);
+        assert_eq!(
+            store.get(&key)?,
+            Some(value.clone()),
+            "lost {key} after reopen"
+        );
+    }
+
+    Ok(())
+}
+
+// A key merged into a compaction output (id above the active file) and then
+// overwritten in the still-active file must keep the NEW value across reopen:
+// replay is later-id-wins, so the active writer has to rotate above the
+// compaction outputs before accepting further writes.
+#[test_log::test]
+fn overwrite_after_compaction_survives_reopen() -> Result<()> {
+    let temp_dir = TempDir::new().expect("unable to create temporary working directory");
+    let store = Bitcask::open(Config {
+        file_size_threshold: 2048,
+        compaction_threshold: 2048,
+        ..Config::new(temp_dir.path(), StoreType::Bitcask)
+    })?;
+
+    store.set("k1", "old")?;
+
+    // First pass seals k1 into an old file; second pass makes the first pass
+    // stale and pushes past the compaction threshold, so k1 (still live, still
+    // in the old file) gets merged into a compaction output.
+    write_filler_pass(&store)?;
+    write_filler_pass(&store)?;
+
+    store.set("k1", "new")?;
+    assert_eq!(store.get("k1")?, Some("new".to_owned()));
+
+    drop(store);
+    let store = Bitcask::open(Config::new(temp_dir.path(), StoreType::Bitcask))?;
+    assert_eq!(store.get("k1")?, Some("new".to_owned()));
+    assert_eq!(store.get("filler0")?, Some(filler_value()));
+
+    Ok(())
+}
+
+// Every compaction output gets a sibling hint file (000004.data -> 000004.hint)
+// describing its records, and no hint file may outlive its data file.
+#[test_log::test]
+fn merge_writes_hint_files_next_to_outputs() -> Result<()> {
+    let temp_dir = TempDir::new().expect("unable to create temporary working directory");
+    let store = Bitcask::open(Config {
+        file_size_threshold: 2048,
+        compaction_threshold: 2048,
+        ..Config::new(temp_dir.path(), StoreType::Bitcask)
+    })?;
+
+    write_filler_pass(&store)?;
+    write_filler_pass(&store)?;
+    drop(store);
+
+    let mut hint_files = 0;
+    let mut non_empty_hint_files = 0;
+    for entry in std::fs::read_dir(temp_dir.path())? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(stem) = name.strip_suffix(".hint") {
+            hint_files += 1;
+            if entry.metadata()?.len() > 0 {
+                non_empty_hint_files += 1;
+            }
+            let data_sibling = temp_dir.path().join(format!("{stem}.data"));
+            assert!(
+                data_sibling.exists(),
+                "hint file {name} has no data file sibling"
+            );
+        }
+    }
+    assert!(hint_files >= 1, "merge should write at least one hint file");
+    assert!(
+        non_empty_hint_files >= 1,
+        "at least one hint file should describe live records"
+    );
+
+    Ok(())
+}
+
+// Hint files are a startup optimization: damaged or orphaned ones must never
+// brick open() or corrupt the recovered data.
+#[test_log::test]
+fn open_survives_corrupt_and_orphan_hint_files() -> Result<()> {
+    let temp_dir = TempDir::new().expect("unable to create temporary working directory");
+
+    let config = || Config {
+        file_size_threshold: 2048,
+        compaction_threshold: 2048,
+        ..Config::new(temp_dir.path(), StoreType::Bitcask)
+    };
+
+    let store = Bitcask::open(config())?;
+    write_filler_pass(&store)?;
+    write_filler_pass(&store)?;
+    drop(store);
+
+    // an orphan hint with no data file (e.g. crash between merge steps)
+    std::fs::write(temp_dir.path().join("000099.hint"), b"orphan")?;
+    // a foreign file that merely looks hint-like
+    std::fs::write(temp_dir.path().join("abc.hint"), b"not ours")?;
+
+    // every real hint file gets its content replaced with garbage
+    for entry in std::fs::read_dir(temp_dir.path())? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".hint") && name != "000099.hint" {
+            std::fs::write(entry.path(), b"this is not a hint record")?;
+        }
+    }
+
+    let store = Bitcask::open(config())?;
+    assert_filler_pass(&store, "after corrupting hints")?;
+
+    assert!(
+        !temp_dir.path().join("000099.hint").exists(),
+        "orphan hint with no data file should be removed on open"
+    );
+    assert!(
+        temp_dir.path().join("abc.hint").exists(),
+        "foreign .hint files must be kept"
+    );
+
+    Ok(())
+}
+
+// Loading the keydir from hints and rebuilding it by replay must agree, and
+// a successful hint load must not consume the hint files.
+#[test_log::test]
+fn reopen_from_hints_matches_replay_from_data() -> Result<()> {
+    let temp_dir = TempDir::new().expect("unable to create temporary working directory");
+    let config = || Config {
+        file_size_threshold: 2048,
+        compaction_threshold: 2048,
+        ..Config::new(temp_dir.path(), StoreType::Bitcask)
+    };
+
+    let store = Bitcask::open(config())?;
+    write_filler_pass(&store)?;
+    write_filler_pass(&store)?;
+    drop(store);
+
+    let hint_paths: Vec<std::path::PathBuf> = std::fs::read_dir(temp_dir.path())?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "hint"))
+        .collect();
+    assert!(!hint_paths.is_empty(), "merge should have written hints");
+
+    // reopen #1: keydir comes from the hints
+    let store = Bitcask::open(config())?;
+    assert_filler_pass(&store, "hint path")?;
+    drop(store);
+
+    for path in &hint_paths {
+        assert!(
+            path.exists(),
+            "a successful hint load must not delete {path:?}"
+        );
+        std::fs::remove_file(path)?;
+    }
+
+    // reopen #2: keydir must come out identical from data replay alone
+    let store = Bitcask::open(config())?;
+    assert_filler_pass(&store, "replay path")?;
 
     Ok(())
 }
@@ -759,7 +833,7 @@ fn open_removes_compact_leftovers_but_keeps_foreign_files() -> Result<()> {
     let leftover = temp_dir.path().join("000007.data.compact");
     std::fs::write(&leftover, "half-written merge output")?;
 
-    let store = Bitcask::open(Config::new(temp_dir.path()))?;
+    let store = Bitcask::open(Config::new(temp_dir.path(), StoreType::Bitcask))?;
     store.set("k", "v")?;
     assert_eq!(store.get("k")?, Some("v".to_owned()));
     drop(store);
@@ -778,7 +852,7 @@ fn open_removes_compact_leftovers_but_keeps_foreign_files() -> Result<()> {
 #[test_log::test]
 fn compaction() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    let store = Bitcask::open(Config::new(temp_dir.path()))?;
+    let store = Bitcask::open(Config::new(temp_dir.path(), StoreType::Bitcask))?;
 
     let dir_size = || {
         let entries = WalkDir::new(temp_dir.path()).into_iter();
@@ -808,7 +882,7 @@ fn compaction() -> Result<()> {
 
         drop(store);
         // reopen and check content.
-        let store = Bitcask::open(Config::new(temp_dir.path()))?;
+        let store = Bitcask::open(Config::new(temp_dir.path(), StoreType::Bitcask))?;
         for key_id in 0..1000 {
             let key = format!("key{}", key_id);
             assert_eq!(store.get(&key)?, Some(format!("{}", iter)));
