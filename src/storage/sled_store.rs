@@ -6,6 +6,7 @@ use std::sync::Arc;
 pub struct SledStore {
     db: sled::Db,
     sync_every_put: bool,
+    #[allow(dead_code)]
     lock_file: Arc<LockFile>,
 }
 

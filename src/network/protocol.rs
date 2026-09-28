@@ -143,7 +143,7 @@ pub fn execute<S: KvStore>(store: &S, req: Request) -> Response {
     result.unwrap_or_else(|e| Response::Error(ErrorCode::from(&e)))
 }
 
-fn utf8(b: &[u8]) -> Result<&str> {
+pub fn utf8(b: &[u8]) -> Result<&str> {
     std::str::from_utf8(b).map_err(|_| KvsError::InvalidData("invalid utf-8".into()))
 }
 

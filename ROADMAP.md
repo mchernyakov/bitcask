@@ -125,7 +125,7 @@ is why project 4 demands that signature.
 - [x] Run the engine benchmark and write down *why* sled differs (its page
   cache, `insert` returning the old value, flush cadence vs. our durability
   policies). Reading sled's docs for this is half the value of the item above.
-- [ ] Stretch with a big payoff: speak a subset of RESP instead of (or beside)
+- [x] Stretch with a big payoff: speak a subset of RESP instead of (or beside)
   the custom protocol, so `redis-cli` and `redis-benchmark` work against the
   store for free — instant load-testing tooling.
 
